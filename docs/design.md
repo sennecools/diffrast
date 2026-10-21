@@ -11,7 +11,9 @@ src/diffrast/
   context.py          RasterizeContext
   backends/
     reference.py      pure PyTorch, ground truth for tests
-    triton.py         Triton kernels for CUDA and ROCm
+    triton.py         Triton backend for CUDA and ROCm
+    _triton_*.py      Triton kernels, imported only when used
+benchmarks/           timing scripts
 ```
 
 `ops.py` owns the public signatures and all input checks. Backends receive validated arguments
@@ -49,19 +51,28 @@ barycentrics of the winning triangle are then recomputed per pixel with autograd
 gradients reach exactly the vertices of the visible triangle. `rast_db` uses the analytic
 derivatives of `b` with respect to `(px, py)`.
 
-## rasterize
+## Triton rasterize
 
-1. **Setup.** Per triangle: clip against the near plane, project to screen space, compute the
-   screen-space bounding box and edge-function coefficients. Back-facing and degenerate triangles
-   are kept; culling is the caller's choice.
-2. **Binning.** The image is split into tiles (16 x 16 pixels to start). Each triangle is appended
-   to the list of every tile its bounding box overlaps.
-3. **Coverage and depth.** One program per tile walks its triangle list, evaluates the edge
-   functions at each pixel centre, and keeps the nearest hit. Two strategies are being compared:
-   a 64-bit atomic min on `(depth, triangle_id)` packed into one integer, and a per-tile sort by
-   depth. 64-bit atomics behave differently across AMD and NVIDIA, so both are measured.
-4. **Barycentrics.** For the winning triangle, perspective-correct `(u, v)` and `z / w` are
-   computed in a second pass, along with their screen-space derivatives for `rast_db`.
+The Triton backend replaces only the visibility pass; `rast` and `rast_db` are then built by the
+same differentiable code as the reference backend (`reference.rasterize_from_ids`), so gradients
+are identical by construction.
+
+1. **Setup** (PyTorch). A triangle is culled when all its vertices have `w <= 0`, or all lie
+   outside the same clip plane (`x > w`, `x < -w`, and so on), since every point on it is a
+   non-negative combination of its vertices. Triangles entirely in front of the camera are
+   bounded by their projected vertices; triangles crossing the camera plane get the whole screen.
+   Back-facing and degenerate triangles are not culled here.
+2. **Binning** (PyTorch). The image is split into 16 x 16 tiles. Each triangle is added to every
+   tile its bounding box overlaps, and the pairs are sorted by tile. Each tile's list is cut into
+   work items of up to 64 triangles.
+3. **Coverage and depth** (`_triton_rasterize._coverage_kernel`). One program per work item
+   evaluates the homogeneous edge functions for its 256 pixels and keeps the nearest hit in
+   registers. Programs that share a tile merge results with a 64-bit `atomic_min` on a key that
+   packs the depth (as an order-preserving integer) in the high 32 bits and the triangle index in
+   the low 32 bits, which also resolves equal depths to the lower index.
+
+The coverage and depth tests use the same formulas as the reference backend, and on the test
+scenes both backends pick the same triangle for every pixel.
 
 ## Gradients
 

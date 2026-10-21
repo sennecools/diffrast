@@ -25,40 +25,50 @@ def rasterize(
     pos: Tensor, tri: Tensor, resolution: tuple[int, int], grad_db: bool
 ) -> tuple[Tensor, Tensor]:
     height, width = resolution
-    batch = pos.shape[0]
-    rast = pos.new_zeros(batch, height, width, 4)
-    rast_db = pos.new_zeros(batch, height, width, 4)
     if tri.shape[0] == 0:
-        return rast, rast_db
-
-    tri = tri.long()
-    px, py = _pixel_centres(height, width, pos)
+        empty = pos.new_zeros(pos.shape[0], height, width, 4)
+        return empty, empty.clone()
+    px, py = pixel_centres(height, width, pos)
     with torch.no_grad():
-        tri_id = _visible_triangles(pos, tri, px, py)
-    covered = tri_id >= 0
+        tri_id = _visible_triangles(pos, tri.long(), px, py)
+    return rasterize_from_ids(pos, tri, tri_id, grad_db)
 
-    batch_idx = torch.arange(batch, device=pos.device)[:, None, None, None]
-    verts = pos[batch_idx, tri[tri_id.clamp(min=0)]]
+
+def rasterize_from_ids(
+    pos: Tensor, tri: Tensor, tri_id: Tensor, grad_db: bool
+) -> tuple[Tensor, Tensor]:
+    """Build ``rast`` and ``rast_db`` from the visible triangle per pixel.
+
+    ``tri_id`` has shape ``[batch, height, width]`` and holds the index of the visible triangle,
+    or -1 for background. Barycentrics are computed here with autograd enabled, so gradients reach
+    the vertices of the visible triangles. Other backends reuse this after their own visibility
+    pass.
+    """
+    batch, height, width = tri_id.shape
+    px, py = pixel_centres(height, width, pos)
+
+    # Work on covered pixels only. Besides saving memory, this keeps background pixels from all
+    # gathering one placeholder triangle, whose gradient accumulation would then serialize.
+    pixel = (tri_id >= 0).nonzero(as_tuple=True)
+    visible = tri_id[pixel]
+    verts = pos[pixel[0][:, None], tri.long()[visible]]
     x, y, z, w = verts.unbind(-1)
-    px, py = px.view(1, 1, width), py.view(1, height, 1)
+    px, py = px[pixel[2]], py[pixel[1]]
 
     e = _edge_functions(x, y, w, px, py)
-    area = torch.where(covered, e.sum(-1), 1.0)
-    b = e / area[..., None]
-    w_p = torch.where(covered, (b * w).sum(-1), 1.0)
-    depth = (b * z).sum(-1) / w_p
+    area = e.sum(-1, keepdim=True)
+    b = e / area
+    depth = (b * z).sum(-1) / (b * w).sum(-1)
 
     de_dx, de_dy = _edge_derivatives(x, y, w, px, py)
-    db_dx = (de_dx - b * de_dx.sum(-1, keepdim=True)) / area[..., None]
-    db_dy = (de_dy - b * de_dy.sum(-1, keepdim=True)) / area[..., None]
+    db_dx = (de_dx - b * de_dx.sum(-1, keepdim=True)) / area
+    db_dy = (de_dy - b * de_dy.sum(-1, keepdim=True)) / area
     if not grad_db:
         db_dx, db_dy = db_dx.detach(), db_dy.detach()
 
-    mask = covered[..., None]
-    rast = torch.stack([b[..., 0], b[..., 1], depth, (tri_id + 1).to(pos.dtype)], -1)
-    rast = torch.where(mask, rast, 0.0)
+    values = torch.stack([b[..., 0], b[..., 1], depth, (visible + 1).to(pos.dtype)], -1)
     # The pixel grid spans 2 NDC units, so one pixel is 2 / size in NDC.
-    rast_db = torch.stack(
+    derivs = torch.stack(
         [
             db_dx[..., 0] * (2 / width),
             db_dy[..., 0] * (2 / height),
@@ -67,7 +77,8 @@ def rasterize(
         ],
         -1,
     )
-    rast_db = torch.where(mask, rast_db, 0.0)
+    rast = pos.new_zeros(batch, height, width, 4).index_put(pixel, values)
+    rast_db = pos.new_zeros(batch, height, width, 4).index_put(pixel, derivs)
     return rast, rast_db
 
 
@@ -82,25 +93,24 @@ def interpolate(
         return out, out_da
 
     tri_id = rast[..., 3].round().long() - 1
-    covered = (tri_id >= 0)[..., None]
+    pixel = (tri_id >= 0).nonzero(as_tuple=True)
     if attr.ndim == 2:
         attr = attr[None]
     attr = attr.expand(batch, -1, -1)
-    batch_idx = torch.arange(batch, device=rast.device)[:, None, None, None]
-    a0, a1, a2 = attr[batch_idx, tri.long()[tri_id.clamp(min=0)]].unbind(-2)
+    a0, a1, a2 = attr[pixel[0][:, None], tri.long()[tri_id[pixel]]].unbind(-2)
 
-    u, v = rast[..., 0:1], rast[..., 1:2]
-    out = torch.where(covered, u * a0 + v * a1 + (1 - u - v) * a2, 0.0)
+    u, v = rast[pixel][:, 0:1], rast[pixel][:, 1:2]
+    out = out.index_put(pixel, u * a0 + v * a1 + (1 - u - v) * a2)
     if not diff_attrs:
         return out, None
 
-    da_du = (a0 - a2)[..., list(diff_attrs)]
-    da_dv = (a1 - a2)[..., list(diff_attrs)]
-    du_dx, du_dy, dv_dx, dv_dy = rast_db[..., None].unbind(-2)
+    da_du = (a0 - a2)[:, list(diff_attrs)]
+    da_dv = (a1 - a2)[:, list(diff_attrs)]
+    du_dx, du_dy, dv_dx, dv_dy = rast_db[pixel][:, :, None].unbind(1)
     d_dx = du_dx * da_du + dv_dx * da_dv
     d_dy = du_dy * da_du + dv_dy * da_dv
-    out_da = torch.stack([d_dx, d_dy], -1).flatten(-2)
-    return out, torch.where(covered, out_da, 0.0)
+    out_da = out_da.index_put(pixel, torch.stack([d_dx, d_dy], -1).flatten(-2))
+    return out, out_da
 
 
 def texture(
@@ -120,7 +130,7 @@ def antialias(
     raise NotImplementedError("antialias is not implemented in the reference backend yet.")
 
 
-def _pixel_centres(height: int, width: int, like: Tensor) -> tuple[Tensor, Tensor]:
+def pixel_centres(height: int, width: int, like: Tensor) -> tuple[Tensor, Tensor]:
     px = (torch.arange(width, dtype=like.dtype, device=like.device) * 2 + 1) / width - 1
     py = (torch.arange(height, dtype=like.dtype, device=like.device) * 2 + 1) / height - 1
     return px, py

@@ -7,8 +7,9 @@
 A differentiable mesh rasterizer for PyTorch that runs on **AMD (ROCm) and NVIDIA (CUDA)** GPUs,
 under the **MIT license**, with an API that mirrors [nvdiffrast](https://github.com/NVlabs/nvdiffrast).
 
-> **Status: early development.** `rasterize` and `interpolate` work on the reference backend;
-> `texture`, `antialias` and the Triton kernels are in progress. See the [roadmap](#roadmap).
+> **Status: early development.** `rasterize` runs on Triton (AMD and NVIDIA) and `interpolate`
+> on the reference backend; `texture` and `antialias` are in progress. See the
+> [roadmap](#roadmap).
 
 ## Why
 
@@ -98,7 +99,8 @@ RX 9070 XT.
 - [x] Public API and input validation
 - [x] Reference backend: `rasterize`, `interpolate`
 - [ ] Reference backend: `texture`, `antialias`
-- [ ] Triton backend: `rasterize`, `interpolate`
+- [x] Triton backend: `rasterize`
+- [ ] Triton backend: `interpolate`
 - [ ] Triton backend: `texture`, `antialias`
 - [ ] Texture-fitting example
 - [ ] Benchmarks on AMD and NVIDIA

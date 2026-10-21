@@ -7,13 +7,20 @@ from collections.abc import Sequence
 from torch import Tensor
 
 # Ops with a Triton kernel. "auto" backend selection routes the others to the reference backend.
-IMPLEMENTED: frozenset[str] = frozenset()
+IMPLEMENTED: frozenset[str] = frozenset({"rasterize"})
 
 
 def rasterize(
     pos: Tensor, tri: Tensor, resolution: tuple[int, int], grad_db: bool
 ) -> tuple[Tensor, Tensor]:
-    raise NotImplementedError("rasterize is not implemented in the triton backend yet.")
+    from diffrast.backends._triton_rasterize import visible_triangles
+    from diffrast.backends.reference import rasterize_from_ids
+
+    if tri.shape[0] == 0:
+        empty = pos.new_zeros(pos.shape[0], *resolution, 4)
+        return empty, empty.clone()
+    tri_id = visible_triangles(pos, tri, resolution)
+    return rasterize_from_ids(pos, tri, tri_id, grad_db)
 
 
 def interpolate(
