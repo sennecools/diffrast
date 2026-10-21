@@ -54,7 +54,7 @@ def rasterize(
     if pos.device != ctx.device:
         raise ValueError(f"pos is on {pos.device} but the context is on {ctx.device}.")
     height, width = _check_resolution(resolution)
-    return get_backend(pos.device).rasterize(pos, tri, (height, width), grad_db)
+    return get_backend(pos.device, "rasterize").rasterize(pos, tri, (height, width), grad_db)
 
 
 def interpolate(
@@ -105,7 +105,7 @@ def interpolate(
             raise ValueError("rast_db must have the same shape as rast.")
 
     _check_devices(attr=attr, rast=rast, tri=tri, rast_db=rast_db)
-    return get_backend(rast.device).interpolate(attr, rast, tri, rast_db, channels)
+    return get_backend(rast.device, "interpolate").interpolate(attr, rast, tri, rast_db, channels)
 
 
 def texture(
@@ -162,7 +162,9 @@ def texture(
         raise ValueError(f"max_mip_level must be non-negative, got {max_mip_level}.")
 
     _check_devices(tex=tex, uv=uv, uv_da=uv_da)
-    return get_backend(uv.device).texture(tex, uv, uv_da, filter_mode, boundary_mode, max_mip_level)
+    return get_backend(uv.device, "texture").texture(
+        tex, uv, uv_da, filter_mode, boundary_mode, max_mip_level
+    )
 
 
 def antialias(
@@ -197,7 +199,9 @@ def antialias(
             f"pos batch size {pos.shape[0]} does not match rast batch size {rast.shape[0]}."
         )
     _check_devices(color=color, rast=rast, pos=pos, tri=tri)
-    return get_backend(color.device).antialias(color, rast, pos, tri, float(pos_gradient_boost))
+    return get_backend(color.device, "antialias").antialias(
+        color, rast, pos, tri, float(pos_gradient_boost)
+    )
 
 
 def _check(

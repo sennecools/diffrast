@@ -6,6 +6,9 @@ from collections.abc import Sequence
 
 from torch import Tensor
 
+# Ops with a Triton kernel. "auto" backend selection routes the others to the reference backend.
+IMPLEMENTED: frozenset[str] = frozenset()
+
 
 def rasterize(
     pos: Tensor, tri: Tensor, resolution: tuple[int, int], grad_db: bool

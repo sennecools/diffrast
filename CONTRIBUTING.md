@@ -28,6 +28,9 @@ pip install -e . --group dev
 pre-commit install
 ```
 
+For a GPU setup on Windows, including AMD, see the installation notes in the
+[README](README.md#installation).
+
 ## Tests
 
 ```bash

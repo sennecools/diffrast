@@ -60,7 +60,7 @@ peeling, cube-map textures, `mip_level_bias` and precomputed `mip` stacks.
 
 | Backend | Devices | Notes |
 | --- | --- | --- |
-| `triton` | CUDA and ROCm GPUs | Default on GPU when Triton is installed |
+| `triton` | CUDA and ROCm GPUs | Default on GPU for ops it implements, when Triton is installed |
 | `reference` | Any PyTorch device | Pure PyTorch; slow, used for testing and as a fallback |
 
 Select one with `dr.set_backend("reference")` or the `DIFFRAST_BACKEND` environment variable.
@@ -74,8 +74,24 @@ diffrast is not on PyPI yet. Install PyTorch for your platform first
 pip install git+https://github.com/sennecools/diffrast
 ```
 
-Linux builds of PyTorch ship with Triton. On Windows, only the reference backend is currently
-available.
+Linux builds of PyTorch ship with Triton. On Windows, install
+[`triton-windows`](https://github.com/triton-lang/triton-windows), which supports both NVIDIA
+and AMD GPUs.
+
+### AMD GPUs on Windows
+
+AMD publishes ROCm builds of PyTorch for Windows on its own package index. The GPU kernels come
+in a separate package per architecture, selected with an extra (`device-gfx1201` for the
+RX 9070 series; see `torch.cuda.get_arch_list()` for the names):
+
+```bash
+pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ --extra-index-url https://pypi.org/simple "torch[device-gfx1201]==2.13.0+rocm10.0.0"
+pip install triton-windows
+```
+
+Pin the `+rocm` version: without the pin, a newer CPU-only `torch` from PyPI can win the
+resolution. Tested with `torch 2.13.0+rocm10.0.0` and `triton-windows 3.8.0.post29` on an
+RX 9070 XT.
 
 ## Roadmap
 
