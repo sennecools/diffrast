@@ -14,12 +14,30 @@ IMPLEMENTED: frozenset[str] = frozenset({"rasterize", "interpolate", "texture", 
 def rasterize(
     pos: Tensor, tri: Tensor, resolution: tuple[int, int], grad_db: bool
 ) -> tuple[Tensor, Tensor]:
-    from diffrast.backends._triton_rasterize import visible_keys
+    rast, rast_db, _ = rasterize_layer(pos, tri, resolution, grad_db, None)
+    return rast, rast_db
+
+
+def rasterize_layer(
+    pos: Tensor,
+    tri: Tensor,
+    resolution: tuple[int, int],
+    grad_db: bool,
+    previous: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Rasterize the nearest layer behind ``previous``, the state returned for the layer before.
+
+    The state is the packed ``(depth, triangle)`` visibility key per pixel.
+    """
+    from diffrast.backends._triton_rasterize import EMPTY, visible_keys
 
     if tri.shape[0] == 0:
         empty = pos.new_zeros(pos.shape[0], *resolution, 4)
-        return empty, empty.clone()
-    return resolve(pos, tri, visible_keys(pos, tri, resolution), grad_db)
+        keys = torch.full((pos.shape[0], *resolution), EMPTY, device=pos.device)
+        return empty, empty.clone(), keys
+    keys = visible_keys(pos, tri, resolution, previous)
+    rast, rast_db = resolve(pos, tri, keys, grad_db)
+    return rast, rast_db, keys
 
 
 def resolve(pos: Tensor, tri: Tensor, keys: Tensor, grad_db: bool) -> tuple[Tensor, Tensor]:

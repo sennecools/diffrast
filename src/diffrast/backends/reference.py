@@ -25,14 +25,32 @@ _CHUNK_ELEMENTS = 1 << 22
 def rasterize(
     pos: Tensor, tri: Tensor, resolution: tuple[int, int], grad_db: bool
 ) -> tuple[Tensor, Tensor]:
+    rast, rast_db, _ = rasterize_layer(pos, tri, resolution, grad_db, None)
+    return rast, rast_db
+
+
+def rasterize_layer(
+    pos: Tensor,
+    tri: Tensor,
+    resolution: tuple[int, int],
+    grad_db: bool,
+    previous: tuple[Tensor, Tensor] | None,
+) -> tuple[Tensor, Tensor, tuple[Tensor, Tensor]]:
+    """Rasterize the nearest layer behind ``previous``, the state returned for the layer before.
+
+    The state is the visibility depth and triangle index per pixel. Layers are ordered by depth
+    and then by triangle index, so triangles at equal depth each get their own layer.
+    """
     height, width = resolution
     if tri.shape[0] == 0:
         empty = pos.new_zeros(pos.shape[0], height, width, 4)
-        return empty, empty.clone()
+        none = torch.full((pos.shape[0], height, width), -1, device=pos.device)
+        return empty, empty.clone(), (pos.new_full(none.shape, torch.inf), none)
     px, py = pixel_centres(height, width, pos)
     with torch.no_grad():
-        tri_id = _visible_triangles(pos, tri.long(), px, py)
-    return rasterize_from_ids(pos, tri, tri_id, grad_db)
+        depth, tri_id = _visible_triangles(pos, tri.long(), px, py, previous)
+    rast, rast_db = rasterize_from_ids(pos, tri, tri_id, grad_db)
+    return rast, rast_db, (depth, tri_id)
 
 
 def rasterize_from_ids(
@@ -235,13 +253,21 @@ def _edge_derivatives(
     return de_dx, de_dy
 
 
-def _visible_triangles(pos: Tensor, tri: Tensor, px: Tensor, py: Tensor) -> Tensor:
-    """Index of the nearest covering triangle per pixel, or -1. Ties go to the lower index."""
+def _visible_triangles(
+    pos: Tensor, tri: Tensor, px: Tensor, py: Tensor, previous: tuple[Tensor, Tensor] | None = None
+) -> tuple[Tensor, Tensor]:
+    """Depth and index of the nearest covering triangle per pixel; index -1 where there is none.
+
+    Ties go to the lower index. With ``previous`` (depth and index of an earlier layer), only
+    triangles ordered after it by ``(depth, index)`` are considered.
+    """
     batch, height, width = pos.shape[0], py.shape[0], px.shape[0]
     best_depth = pos.new_full((batch, height, width), torch.inf)
     best_id = torch.full((batch, height, width), -1, dtype=torch.long, device=pos.device)
     chunk = max(1, _CHUNK_ELEMENTS // (batch * height * width))
     px, py = px.view(1, 1, 1, width), py.view(1, 1, height, 1)
+    if previous is not None:
+        prev_depth, prev_id = (t[:, None] for t in previous)
 
     for start in range(0, tri.shape[0], chunk):
         verts = pos[:, tri[start : start + chunk]][:, :, None, None]
@@ -251,13 +277,17 @@ def _visible_triangles(pos: Tensor, tri: Tensor, px: Tensor, py: Tensor) -> Tens
         w_p = (b * w).sum(-1)
         depth = (b * z).sum(-1) / w_p
         inside = (b >= 0).all(-1) & (w_p > 0) & (depth >= -1) & (depth <= 1)
+        if previous is not None:
+            index = torch.arange(start, start + x.shape[1], device=pos.device)[:, None, None]
+            later = (depth > prev_depth) | ((depth == prev_depth) & (index > prev_id))
+            inside &= later
         depth = torch.where(inside, depth, torch.inf)
 
         chunk_depth, chunk_id = depth.min(dim=1)
         closer = chunk_depth < best_depth
         best_depth = torch.where(closer, chunk_depth, best_depth)
         best_id = torch.where(closer, chunk_id + start, best_id)
-    return best_id
+    return best_depth, best_id
 
 
 def _mip_chain(tex: Tensor, max_mip_level: int | None) -> list[Tensor]:

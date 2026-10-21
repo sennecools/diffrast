@@ -24,6 +24,8 @@ All notable changes to this project are documented here. The format is based on
 - Triton `interpolate`, forward and backward, including attribute derivatives.
 - Triton `texture` for all filter and boundary modes, forward and backward. Texel gradients are
   pre-reduced in registers where pixels share texels before they are written with atomics.
+- `DepthPeeler` for depth peeling, with nvdiffrast's `rasterize_next_layer()` interface, on both
+  backends. Triangles at equal depth are returned in turn, in index order.
 - `texture` accepts `mip_level_bias`, a per-pixel offset to the mip level of detail that also
   works without `uv_da` and receives gradients with trilinear filtering.
 - Triton `antialias`, forward and backward, with position gradients chained analytically through

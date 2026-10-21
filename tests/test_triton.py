@@ -511,3 +511,64 @@ class TestResolve:
         assert torch.autograd.gradcheck(
             lambda p: triton_backend.rasterize(p, tri, (8, 8), True), (pos,)
         )
+
+
+class TestDepthPeeling:
+    def layers(self, backend, pos, tri, resolution, count):
+        state, out = None, []
+        for _ in range(count):
+            rast, rast_db, state = backend.rasterize_layer(pos, tri, resolution, True, state)
+            out.append((rast, rast_db))
+        return out
+
+    @pytest.mark.parametrize("mesh", [{}, {"w_range": (-1.0, 2.0)}, {"xy_range": 0.6}])
+    def test_layers_match_reference(self, mesh):
+        pos, tri = random_mesh(60, torch.Generator().manual_seed(3), batch=2, **mesh)
+        ref = self.layers(reference, pos, tri, (40, 56), 6)
+        out = self.layers(triton_backend, pos, tri, (40, 56), 6)
+        assert (ref[2][0][..., 3] > 0).any(), "the scene should have several layers"
+        for (r, _), (o, o_db) in zip(ref, out, strict=True):
+            same = r[..., 3] == o[..., 3]
+            assert same.float().mean() > 0.999
+            tri_id = r[..., 3].long() - 1
+            exact, exact_db = reference.rasterize_from_ids(pos.double(), tri, tri_id, True)
+            for ours, truth in ((o, exact), (o_db, exact_db)):
+                error = (ours.double() - truth).abs() / truth.abs().clamp_min(1)
+                assert error[same].max() < 1e-4
+
+    @pytest.mark.parametrize("small", [1, 8])
+    def test_equal_depths_in_index_order(self, monkeypatch, small):
+        # Both the small-triangle path and tile binning must order coplanar layers by index.
+        monkeypatch.setattr(_triton_rasterize, "SMALL", small)
+        quad = [[-0.2, -0.2, 0.25, 1.0], [0.2, -0.2, 0.25, 1.0], [0.0, 0.2, 0.25, 1.0]]
+        pos = torch.tensor([quad * 3]).cuda()
+        tri = torch.tensor([[6, 7, 8], [0, 1, 2], [3, 4, 5]], dtype=torch.int32).cuda()
+        layers = self.layers(triton_backend, pos, tri, (8, 8), 4)
+        covered = layers[0][0][..., 3] > 0
+        assert covered.any()
+        for (rast, _), expected in zip(layers, [1, 2, 3, 0], strict=True):
+            assert (rast[..., 3][covered] == expected).all()
+
+    def test_second_layer_gradients_match_reference(self):
+        pos, tri = random_mesh(40, torch.Generator().manual_seed(4), xy_range=0.8)
+        weights = torch.randn(1, 32, 32, 4, generator=torch.Generator().manual_seed(5)).cuda()
+        grads = []
+        for backend in (reference, triton_backend):
+            p = pos.clone().requires_grad_(True)
+            (rast, rast_db) = self.layers(backend, p, tri, (32, 32), 2)[1]
+            ((rast[..., :3] * weights[..., :3]).sum() + (rast_db * weights).sum()).backward()
+            grads.append(p.grad)
+        torch.testing.assert_close(
+            grads[1], grads[0], atol=1e-4 * grads[0].abs().max().item(), rtol=1e-4
+        )
+
+    def test_depth_peeler_uses_triton(self):
+        pos, tri = random_mesh(20, torch.Generator().manual_seed(6))
+        ctx = dr.RasterizeContext("cuda")
+        with dr.DepthPeeler(ctx, pos, tri, (32, 32)) as peeler:
+            first, _ = peeler.rasterize_next_layer()
+            second, _ = peeler.rasterize_next_layer()
+        assert peeler._backend is triton_backend
+        both = (first[..., 3] > 0) & (second[..., 3] > 0)
+        assert both.any()
+        assert (second[..., 2][both] >= first[..., 2][both]).all()

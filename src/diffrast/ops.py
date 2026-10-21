@@ -46,15 +46,8 @@ def rasterize(
         holds ``(u, v, z / w, triangle_id + 1)``, and is all zeros where no triangle covers it.
         ``rast_db`` holds the screen-space derivatives ``(du/dx, du/dy, dv/dx, dv/dy)``.
     """
-    if ranges is not None:
-        raise NotImplementedError("Range mode (ranges=...) is not supported yet.")
-    _check(pos, "pos", ndim=3, last=4, dtype=torch.float32)
-    _check(tri, "tri", ndim=2, last=3, dtype=torch.int32)
-    _check_devices(pos=pos, tri=tri)
-    if pos.device != ctx.device:
-        raise ValueError(f"pos is on {pos.device} but the context is on {ctx.device}.")
-    height, width = _check_resolution(resolution)
-    return get_backend(pos.device, "rasterize").rasterize(pos, tri, (height, width), grad_db)
+    resolution = check_rasterize_inputs(ctx, pos, tri, resolution, ranges)
+    return get_backend(pos.device, "rasterize").rasterize(pos, tri, resolution, grad_db)
 
 
 def interpolate(
@@ -215,6 +208,24 @@ def antialias(
     return get_backend(color.device, "antialias").antialias(
         color, rast, pos, tri, float(pos_gradient_boost)
     )
+
+
+def check_rasterize_inputs(
+    ctx: RasterizeContext,
+    pos: Tensor,
+    tri: Tensor,
+    resolution: Sequence[int],
+    ranges: Tensor | None,
+) -> tuple[int, int]:
+    """Validate the arguments of :func:`rasterize` and return the resolution as two ints."""
+    if ranges is not None:
+        raise NotImplementedError("Range mode (ranges=...) is not supported yet.")
+    _check(pos, "pos", ndim=3, last=4, dtype=torch.float32)
+    _check(tri, "tri", ndim=2, last=3, dtype=torch.int32)
+    _check_devices(pos=pos, tri=tri)
+    if pos.device != ctx.device:
+        raise ValueError(f"pos is on {pos.device} but the context is on {ctx.device}.")
+    return _check_resolution(resolution)
 
 
 def _check(

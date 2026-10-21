@@ -81,12 +81,20 @@ def _pixel_range(lo, hi, size):
 
 
 @triton.jit
+def _behind(key, prev_ptr, offs, mask):
+    """``key`` where it is ordered after the previous layer's key at ``offs``, else empty."""
+    prev = tl.load(prev_ptr + offs, mask=mask, other=0x7FFFFFFFFFFFFFFF)
+    return tl.where(key > prev, key, 0x7FFFFFFFFFFFFFFF)
+
+
+@triton.jit
 def _setup_kernel(
     pos_ptr,
     tri_ptr,
     px_ptr,
     py_ptr,
     out_ptr,
+    prev_ptr,
     tile_box_ptr,
     total,
     num_tri,
@@ -96,6 +104,7 @@ def _setup_kernel(
     TILE: tl.constexpr,
     SMALL: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_PREV: tl.constexpr,
 ):
     g = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     valid = g < total
@@ -149,6 +158,8 @@ def _setup_kernel(
         px, py, t[:, None],
     )  # fmt: skip
     offs = (b[:, None] * height + row) * width + col
+    if HAS_PREV:
+        key = _behind(key, prev_ptr, offs, lane_ok)
     tl.atomic_min(out_ptr + offs, key, mask=lane_ok & (key != 0x7FFFFFFFFFFFFFFF))
 
     large = visible & ~small
@@ -170,6 +181,7 @@ def _tile_kernel(
     px_ptr,
     py_ptr,
     out_ptr,
+    prev_ptr,
     num_tri,
     num_vert,
     height,
@@ -177,6 +189,7 @@ def _tile_kernel(
     tiles_x,
     tiles_per_image,
     TILE: tl.constexpr,
+    HAS_PREV: tl.constexpr,
 ):
     item = tl.program_id(0)
     tile = tl.load(item_tile_ptr + item)
@@ -190,6 +203,8 @@ def _tile_kernel(
     px = tl.load(px_ptr + col, mask=col < width, other=0.0)
     py = tl.load(py_ptr + row, mask=row < height, other=0.0)
 
+    offs = (image * height + row) * width + col
+    inside = (row < height) & (col < width)
     best = tl.full((TILE, TILE), 0x7FFFFFFFFFFFFFFF, tl.int64)
     for i in range(start, end):
         g = tl.load(tri_list_ptr + i).to(tl.int64)
@@ -198,10 +213,11 @@ def _tile_kernel(
         x1, y1, z1, w1 = _load_vertex(pos_ptr, tri_ptr, b, t, 1, num_vert, True)
         x2, y2, z2, w2 = _load_vertex(pos_ptr, tri_ptr, b, t, 2, num_vert, True)
         key = _depth_key(x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2, px, py, t)
+        if HAS_PREV:
+            key = _behind(key, prev_ptr, offs, inside)
         best = tl.minimum(best, key)
 
-    offs = (image * height + row) * width + col
-    mask = (row < height) & (col < width) & (best != 0x7FFFFFFFFFFFFFFF)
+    mask = inside & (best != 0x7FFFFFFFFFFFFFFF)
     tl.atomic_min(out_ptr + offs, best, mask=mask)
 
 
@@ -217,6 +233,7 @@ class Pass:
     tile_box: Tensor
     height: int
     width: int
+    previous: Tensor | None = None
 
     @property
     def batch(self) -> int:
@@ -227,12 +244,16 @@ class Pass:
         return self.tri.shape[0]
 
 
-def visible_keys(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> Tensor:
+def visible_keys(
+    pos: Tensor, tri: Tensor, resolution: tuple[int, int], previous: Tensor | None = None
+) -> Tensor:
     """Packed ``(depth, triangle)`` key of the nearest triangle per pixel, ``[batch, h, w]``.
 
     Pixels no triangle covers hold ``EMPTY``. The low 32 bits of a key are the triangle index.
+    With ``previous``, the keys of an earlier layer, only keys ordered after it are considered,
+    which gives the next depth layer.
     """
-    state = prepare(pos, tri, resolution)
+    state = prepare(pos, tri, resolution, previous)
     setup_stage(state)
     tile_stage(state, bin_stage(state))
     return state.keys
@@ -244,7 +265,9 @@ def visible_triangles(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> 
     return torch.where(keys == EMPTY, -1, keys & 0xFFFFFFFF)
 
 
-def prepare(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> Pass:
+def prepare(
+    pos: Tensor, tri: Tensor, resolution: tuple[int, int], previous: Tensor | None = None
+) -> Pass:
     height, width = resolution
     pos = pos.detach().float().contiguous()
     px, py = pixel_centres(height, width, pos)
@@ -258,6 +281,7 @@ def prepare(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> Pass:
         tile_box=torch.empty(batch * num_tri, 4, dtype=torch.int32, device=pos.device),
         height=height,
         width=width,
+        previous=previous,
     )
 
 
@@ -266,10 +290,15 @@ def setup_stage(state: Pass) -> None:
     total = state.batch * state.num_tri
     with torch.cuda.device(state.pos.device):
         _setup_kernel[(triton.cdiv(total, SETUP_BLOCK),)](
-            state.pos, state.tri, state.px, state.py, state.keys, state.tile_box, total,
-            state.num_tri, state.pos.shape[1], state.height, state.width,
-            TILE=TILE, SMALL=SMALL, BLOCK=SETUP_BLOCK,
+            state.pos, state.tri, state.px, state.py, state.keys, _previous(state),
+            state.tile_box, total, state.num_tri, state.pos.shape[1], state.height, state.width,
+            TILE=TILE, SMALL=SMALL, BLOCK=SETUP_BLOCK, HAS_PREV=state.previous is not None,
         )  # fmt: skip
+
+
+def _previous(state: Pass) -> Tensor:
+    # Without a previous layer the argument is unused; the code reading it is compiled out.
+    return state.previous if state.previous is not None else state.keys
 
 
 def bin_stage(state: Pass):
@@ -284,8 +313,8 @@ def tile_stage(state: Pass, lists) -> None:
     with torch.cuda.device(state.pos.device):
         _tile_kernel[(item_tile.shape[0],)](
             state.pos, state.tri, tri_list, item_tile, item_start, item_end, state.px, state.py,
-            state.keys, state.num_tri, state.pos.shape[1], state.height, state.width, tiles_x,
-            tiles_per_image, TILE=TILE,
+            state.keys, _previous(state), state.num_tri, state.pos.shape[1], state.height,
+            state.width, tiles_x, tiles_per_image, TILE=TILE, HAS_PREV=state.previous is not None,
         )  # fmt: skip
 
 

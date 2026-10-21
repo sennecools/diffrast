@@ -58,10 +58,18 @@ loss = torch.nn.functional.mse_loss(color, target)
 loss.backward()  # gradients reach tex and pos_clip
 ```
 
+To render surfaces hidden behind the nearest one, `DepthPeeler` returns one depth layer per call,
+each in the same format as `rasterize`:
+
+```python
+with dr.DepthPeeler(ctx, pos_clip, tri, resolution=(512, 512)) as peeler:
+    layers = [peeler.rasterize_next_layer() for _ in range(4)]
+```
+
 Function names, argument names and argument order follow nvdiffrast's documented API, and
 `RasterizeCudaContext` is an alias of `RasterizeContext`, so most code ports by changing the
-import to `import diffrast as dr`. Not yet supported: the OpenGL context, range mode, depth
-peeling, cube-map textures and precomputed `mip` stacks.
+import to `import diffrast as dr`. Not yet supported: the OpenGL context, range mode, cube-map
+textures and precomputed `mip` stacks.
 
 ### Backends
 

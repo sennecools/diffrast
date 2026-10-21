@@ -42,3 +42,34 @@ def screen_space_rasterize(pos, tri, height, width, margin=1e-4):
     tri_id = torch.where(best_depth.isinf(), -1, tri_id)
     ambiguous = near.any(dim=1) | tie
     return tri_id, best_depth, ambiguous
+
+
+def screen_space_layers(pos, tri, height, width, margin=1e-4):
+    """Covering triangles per pixel sorted by ``(depth, index)``, for triangles in front.
+
+    Returns ``(layers, ambiguous)``: ``layers`` has shape ``[batch, triangles, height, width]``
+    and holds triangle indices in layer order, then -1 once a pixel runs out of triangles.
+    ``ambiguous`` marks pixels near an edge or with two depths within ``margin``.
+    """
+    pos = pos.double()
+    ndc = pos[..., :3] / pos[..., 3:]
+    v = ndc[:, tri.long()][:, :, None, None]
+    p = pixel_centres(height, width, torch.float64)
+    px, py = p[..., 0], p[..., 1]
+
+    def edge(i, j):
+        dx, dy = v[..., j, 0] - v[..., i, 0], v[..., j, 1] - v[..., i, 1]
+        return dx * (py - v[..., i, 1]) - dy * (px - v[..., i, 0])
+
+    lam = torch.stack([edge(1, 2), edge(2, 0), edge(0, 1)], -1)
+    lam = lam / lam.sum(-1, keepdim=True)
+    inside = (lam >= 0).all(-1)
+    depth = torch.where(inside, (lam * v[..., 2]).sum(-1), torch.inf)
+
+    # A stable sort keeps equal depths in index order.
+    sorted_depth, order = depth.sort(dim=1, stable=True)
+    layers = torch.where(sorted_depth.isinf(), -1, order)
+    near_edge = (lam.abs().min(-1).values < margin).any(dim=1)
+    gaps = sorted_depth[:, 1:] - sorted_depth[:, :-1]
+    tie = ((gaps < margin) & (gaps > 0)).any(dim=1)
+    return layers, near_edge | tie

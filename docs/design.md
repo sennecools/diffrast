@@ -187,6 +187,20 @@ vertex's `x`, `y` and `w` are short closed forms; `z` does not affect `t`. In fl
 and reference gradients agree to about `1e-11`; in float32 they differ only by rounding, which is
 largest for vertices close to the camera plane, whose gradients are very large.
 
+## Depth peeling
+
+`DepthPeeler` rasterizes the same geometry repeatedly. Each layer keeps, per pixel, the nearest
+triangle ordered after the previous layer's triangle, where triangles are ordered by depth and
+then by index. Ordering by both, rather than by depth alone, means that triangles at exactly the
+same depth each get their own layer instead of being skipped or repeated.
+
+The comparison has to use the visibility pass's own depth: `rast[..., 2]` is computed separately
+and can differ in the last bit. So each backend carries its visibility result from one layer to
+the next. The reference backend keeps the depth and index per pixel; the Triton backend keeps
+its packed `(depth, index)` keys, so both kernels of the visibility pass only need one extra
+comparison, `key > previous_key`. The resolve pass and the other ops are unchanged, because each
+layer is an ordinary `rast` tensor.
+
 ## Gradients
 
 - Through `rasterize`, gradients flow from `(u, v, z / w)` and `rast_db` into the vertex positions
