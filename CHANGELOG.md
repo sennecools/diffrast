@@ -32,6 +32,10 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- Triton `rasterize` builds `rast` and `rast_db` and their gradients in fused kernels instead of
+  PyTorch ops. At 2048 x 2048 with 8 views on an RX 9070 XT, this stage takes 31 to 43 ms forward
+  and backward instead of 128 to 219 ms.
+- `benchmarks/bench_rasterize.py --stages` times each stage of the Triton rasterizer.
 - `auto` backend selection now routes each op to Triton only if Triton implements it.
 - The reference backend computes barycentrics only for covered pixels, which removes a slow
   gradient accumulation through background pixels and lowers memory use.

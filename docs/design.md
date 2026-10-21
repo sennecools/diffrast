@@ -95,9 +95,11 @@ the gradient through `t` without changing the image.
 
 ## Triton rasterize
 
-The Triton backend replaces only the visibility pass; `rast` and `rast_db` are then built by the
-same differentiable code as the reference backend (`reference.rasterize_from_ids`), so gradients
-are identical by construction.
+Rasterization runs in two passes: a visibility pass that finds the nearest triangle per pixel,
+and a resolve pass that builds `rast` and `rast_db` for it and carries gradients back to `pos`.
+`benchmarks/bench_rasterize.py --stages` times each stage separately.
+
+### Visibility
 
 All paths write to one buffer of 64-bit keys per pixel. A key packs the depth (as an
 order-preserving integer) in the high 32 bits and the triangle index in the low 32 bits, so a
@@ -124,6 +126,24 @@ single `atomic_min` keeps the nearest triangle and resolves equal depths to the 
 Both kernels read vertices through `tri` directly from `pos`, so no per-triangle copy of the
 vertex data is made. The coverage and depth tests use the same formulas as the reference backend,
 and on the test scenes both backends pick the same triangle for every pixel.
+
+### Resolve
+
+`_triton_resolve.py` reads the visibility key of each pixel and evaluates the reference formulas
+for the visible triangle in one kernel: the edge functions `e = a x c`, the barycentrics
+`e / sum(e)`, the depth `(e . z) / (e . w)`, and their screen-space derivatives through
+`de/dpx = c x w` and `de/dpy = w x a`. The backward kernel runs the same steps in reverse, using
+`v x G` and `G x u` as the gradients of `u x v` for an upstream gradient `G`.
+
+Each program handles a 16 x 8 tile of pixels, which mostly show the same few triangles. Before
+vertex gradients are written with atomics, the pixels sharing a vertex are summed in registers,
+round by round in order of vertex address. The rounds stop once they merge fewer than four pixels
+each on average, which happens quickly for dense meshes where few pixels share a vertex, and
+continue for coarse meshes where thousands of pixels contend for each vertex.
+
+In float32 the kernels round differently from the reference code. Compared with a float64
+computation, both are accurate to about `1e-5` relative, including for tiny triangles whose edge
+functions cancel.
 
 ## Triton interpolate
 

@@ -14,14 +14,19 @@ IMPLEMENTED: frozenset[str] = frozenset({"rasterize", "interpolate", "texture", 
 def rasterize(
     pos: Tensor, tri: Tensor, resolution: tuple[int, int], grad_db: bool
 ) -> tuple[Tensor, Tensor]:
-    from diffrast.backends._triton_rasterize import visible_triangles
-    from diffrast.backends.reference import rasterize_from_ids
+    from diffrast.backends._triton_rasterize import visible_keys
 
     if tri.shape[0] == 0:
         empty = pos.new_zeros(pos.shape[0], *resolution, 4)
         return empty, empty.clone()
-    tri_id = visible_triangles(pos, tri, resolution)
-    return rasterize_from_ids(pos, tri, tri_id, grad_db)
+    return resolve(pos, tri, visible_keys(pos, tri, resolution), grad_db)
+
+
+def resolve(pos: Tensor, tri: Tensor, keys: Tensor, grad_db: bool) -> tuple[Tensor, Tensor]:
+    """Build ``rast`` and ``rast_db`` from the visibility keys of :func:`rasterize`."""
+    from diffrast.backends import _triton_resolve
+
+    return _triton_resolve.resolve(pos, tri, keys, grad_db)
 
 
 def interpolate(

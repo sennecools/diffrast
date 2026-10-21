@@ -16,6 +16,8 @@ Coverage and depth use the same homogeneous formulation as the reference backend
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import triton
 import triton.language as tl
@@ -31,7 +33,7 @@ SMALL = 4
 # Triangles per setup program.
 SETUP_BLOCK = 128
 
-_EMPTY = torch.iinfo(torch.int64).max
+EMPTY = torch.iinfo(torch.int64).max
 
 
 @triton.jit
@@ -203,33 +205,88 @@ def _tile_kernel(
     tl.atomic_min(out_ptr + offs, best, mask=mask)
 
 
+@dataclass
+class Pass:
+    """Inputs and buffers shared by the stages of one visibility pass."""
+
+    pos: Tensor
+    tri: Tensor
+    px: Tensor
+    py: Tensor
+    keys: Tensor
+    tile_box: Tensor
+    height: int
+    width: int
+
+    @property
+    def batch(self) -> int:
+        return self.pos.shape[0]
+
+    @property
+    def num_tri(self) -> int:
+        return self.tri.shape[0]
+
+
+def visible_keys(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> Tensor:
+    """Packed ``(depth, triangle)`` key of the nearest triangle per pixel, ``[batch, h, w]``.
+
+    Pixels no triangle covers hold ``EMPTY``. The low 32 bits of a key are the triangle index.
+    """
+    state = prepare(pos, tri, resolution)
+    setup_stage(state)
+    tile_stage(state, bin_stage(state))
+    return state.keys
+
+
 def visible_triangles(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> Tensor:
     """Index of the nearest covering triangle per pixel, ``[batch, height, width]``, or -1."""
-    height, width = resolution
-    batch, num_vert = pos.shape[:2]
-    num_tri = tri.shape[0]
-    device = pos.device
-    pos = pos.detach().float().contiguous()
-    tri = tri.to(torch.int32).contiguous()
-    px, py = pixel_centres(height, width, pos)
-    out = torch.full((batch, height, width), _EMPTY, dtype=torch.int64, device=device)
-    total = batch * num_tri
-    tile_box = torch.empty(total, 4, dtype=torch.int32, device=device)
+    keys = visible_keys(pos, tri, resolution)
+    return torch.where(keys == EMPTY, -1, keys & 0xFFFFFFFF)
 
-    with torch.cuda.device(device):
+
+def prepare(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> Pass:
+    height, width = resolution
+    pos = pos.detach().float().contiguous()
+    px, py = pixel_centres(height, width, pos)
+    batch, num_tri = pos.shape[0], tri.shape[0]
+    return Pass(
+        pos=pos,
+        tri=tri.to(torch.int32).contiguous(),
+        px=px,
+        py=py,
+        keys=torch.full((batch, height, width), EMPTY, dtype=torch.int64, device=pos.device),
+        tile_box=torch.empty(batch * num_tri, 4, dtype=torch.int32, device=pos.device),
+        height=height,
+        width=width,
+    )
+
+
+def setup_stage(state: Pass) -> None:
+    """Cull and bound every triangle; rasterize small ones; mark the rest for tiling."""
+    total = state.batch * state.num_tri
+    with torch.cuda.device(state.pos.device):
         _setup_kernel[(triton.cdiv(total, SETUP_BLOCK),)](
-            pos, tri, px, py, out, tile_box, total, num_tri, num_vert, height, width,
+            state.pos, state.tri, state.px, state.py, state.keys, state.tile_box, total,
+            state.num_tri, state.pos.shape[1], state.height, state.width,
             TILE=TILE, SMALL=SMALL, BLOCK=SETUP_BLOCK,
         )  # fmt: skip
 
-        lists = _bin_triangles(tile_box, batch, height, width)
-        if lists is not None:
-            tri_list, item_tile, item_start, item_end, tiles_x, tiles_per_image = lists
-            _tile_kernel[(item_tile.shape[0],)](
-                pos, tri, tri_list, item_tile, item_start, item_end, px, py, out,
-                num_tri, num_vert, height, width, tiles_x, tiles_per_image, TILE=TILE,
-            )  # fmt: skip
-    return torch.where(out == _EMPTY, -1, out & 0xFFFFFFFF)
+
+def bin_stage(state: Pass):
+    return _bin_triangles(state.tile_box, state.batch, state.height, state.width)
+
+
+def tile_stage(state: Pass, lists) -> None:
+    """Rasterize the binned triangles tile by tile."""
+    if lists is None:
+        return
+    tri_list, item_tile, item_start, item_end, tiles_x, tiles_per_image = lists
+    with torch.cuda.device(state.pos.device):
+        _tile_kernel[(item_tile.shape[0],)](
+            state.pos, state.tri, tri_list, item_tile, item_start, item_end, state.px, state.py,
+            state.keys, state.num_tri, state.pos.shape[1], state.height, state.width, tiles_x,
+            tiles_per_image, TILE=TILE,
+        )  # fmt: skip
 
 
 def _bin_triangles(tile_box: Tensor, batch: int, height: int, width: int):

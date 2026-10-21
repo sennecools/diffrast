@@ -43,14 +43,20 @@ def mixed_mesh(gen):
 
 
 def assert_matches_reference(pos, tri, resolution, max_mismatch=0.0):
-    ref, ref_db = reference.rasterize(pos, tri, resolution, True)
+    ref, _ = reference.rasterize(pos, tri, resolution, True)
     out, out_db = triton_backend.rasterize(pos, tri, resolution, True)
 
     same = ref[..., 3] == out[..., 3]
     mismatch = 1 - same.float().mean().item()
     assert mismatch <= max_mismatch, f"{mismatch:.2%} of pixels picked a different triangle"
-    torch.testing.assert_close(out[same], ref[same])
-    torch.testing.assert_close(out_db[same], ref_db[same])
+
+    # The backends round differently in float32, most visibly for tiny triangles whose edge
+    # functions cancel, so both outputs are compared with float64 values for the same triangles.
+    tri_id = ref[..., 3].long() - 1
+    exact, exact_db = reference.rasterize_from_ids(pos.double(), tri, tri_id, True)
+    for ours, truth in ((out, exact), (out_db, exact_db)):
+        error = (ours.double() - truth).abs() / truth.abs().clamp_min(1)
+        assert error[same].max() < 1e-4
     return ref
 
 
@@ -430,3 +436,53 @@ class TestAntialias:
         pos, tri, rast, color, _ = self.scene()
         dr.antialias(color, rast, pos, tri)
         assert calls
+
+
+class TestResolve:
+    """Building ``rast`` and ``rast_db`` from visibility, forward and backward."""
+
+    def gradients(self, backend, pos, tri, resolution, grad_db=True, use=("rast", "db"), seed=0):
+        gen = torch.Generator().manual_seed(seed)
+        w_rast = torch.randn(pos.shape[0], *resolution, 4, generator=gen, dtype=pos.dtype).cuda()
+        w_db = torch.randn(pos.shape[0], *resolution, 4, generator=gen, dtype=pos.dtype).cuda()
+        p = pos.clone().requires_grad_(True)
+        rast, rast_db = backend.rasterize(p, tri, resolution, grad_db)
+        loss = 0
+        if "rast" in use:
+            loss = loss + (rast[..., :3] * w_rast[..., :3]).sum()
+        if "db" in use and rast_db.requires_grad:
+            loss = loss + (rast_db * w_db).sum()
+        loss.backward()
+        return p.grad
+
+    @pytest.mark.parametrize("use", [("rast",), ("db",), ("rast", "db")])
+    @pytest.mark.parametrize("grad_db", [True, False])
+    def test_gradients_match_reference(self, use, grad_db):
+        pos, tri = random_mesh(80, torch.Generator().manual_seed(1), batch=2, w_range=(-1.0, 2.0))
+        if use == ("db",) and not grad_db:
+            p = pos.clone().requires_grad_(True)
+            _, rast_db = triton_backend.rasterize(p, tri, (40, 56), False)
+            assert not rast_db.requires_grad
+            return
+        ref = self.gradients(reference, pos, tri, (40, 56), grad_db, use)
+        out = self.gradients(triton_backend, pos, tri, (40, 56), grad_db, use)
+        torch.testing.assert_close(out, ref, atol=1e-4 * ref.abs().max().item(), rtol=1e-4)
+
+    def test_large_triangles_share_vertices(self):
+        # A few large triangles at a high resolution: most of each block's pixels add into the
+        # same vertices, which goes through the in-register pre-reduction.
+        pos, tri = random_mesh(6, torch.Generator().manual_seed(2), xy_range=0.9)
+        ref = self.gradients(reference, pos, tri, (256, 256))
+        out = self.gradients(triton_backend, pos, tri, (256, 256))
+        torch.testing.assert_close(out, ref, atol=1e-4 * ref.abs().max().item(), rtol=1e-4)
+
+    def test_gradcheck_float64(self, perspective_triangle):
+        pos, tri = perspective_triangle
+        other = torch.tensor(
+            [[[-0.7, 0.8, -0.2, 1.2], [0.9, 0.6, 0.4, 1.0], [-0.1, -0.9, 0.1, 1.1]]]
+        )
+        pos = torch.cat([pos, other], 1).double().cuda().requires_grad_(True)
+        tri = torch.cat([tri, tri + 3]).cuda()
+        assert torch.autograd.gradcheck(
+            lambda p: triton_backend.rasterize(p, tri, (8, 8), True), (pos,)
+        )
