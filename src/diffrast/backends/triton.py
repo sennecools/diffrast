@@ -8,7 +8,7 @@ import torch
 from torch import Tensor
 
 # Ops with a Triton kernel. "auto" backend selection routes the others to the reference backend.
-IMPLEMENTED: frozenset[str] = frozenset({"rasterize", "interpolate"})
+IMPLEMENTED: frozenset[str] = frozenset({"rasterize", "interpolate", "texture"})
 
 
 def rasterize(
@@ -42,7 +42,9 @@ def texture(
     boundary_mode: str,
     max_mip_level: int | None,
 ) -> Tensor:
-    raise NotImplementedError("texture is not implemented in the triton backend yet.")
+    from diffrast.backends import _triton_texture
+
+    return _triton_texture.texture(tex, uv, uv_da, filter_mode, boundary_mode, max_mip_level)
 
 
 def antialias(

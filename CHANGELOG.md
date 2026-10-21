@@ -22,7 +22,10 @@ All notable changes to this project are documented here. The format is based on
   tile binning. On an RX 9070 XT, a 1M-triangle mesh at 8 views and 512 x 512 goes from about
   220 ms to 6 ms forward.
 - Triton `interpolate`, forward and backward, including attribute derivatives.
-- `benchmarks/bench_rasterize.py` and `benchmarks/bench_interpolate.py`.
+- Triton `texture` for all filter and boundary modes, forward and backward. Texel gradients are
+  pre-reduced in registers where pixels share texels before they are written with atomics.
+- `benchmarks/bench_rasterize.py`, `benchmarks/bench_interpolate.py` and
+  `benchmarks/bench_texture.py`.
 
 ### Changed
 

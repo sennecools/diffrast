@@ -136,6 +136,22 @@ The backward kernel sums the gradients of `u`, `v` and the four `rast_db` entrie
 in registers, so they need no atomics. Gradients to `attr` are scattered to the three vertices of
 each pixel's triangle with `atomic_add`.
 
+## Triton texture
+
+`_triton_texture.py` builds the mip chain with the same PyTorch code as the reference backend and
+packs every level into one `[tex_batch, texels, channels]` buffer, with per-level offsets and
+sizes. Autograd carries gradients from that buffer back through the box filters to the base
+texture, so the kernels only deal with sampling. Each program handles 64 pixels and loops over
+channels in chunks of up to 16; filter and boundary modes are compile-time constants.
+
+The backward kernel sums the gradients of `uv` and of the blend factor between mip levels in
+registers, and chains the latter analytically through the level-of-detail formula into `uv_da`.
+Texel gradients are scattered with `atomic_add`. Atomics on one address serialize, and many
+pixels often share a texel: background pixels all sample the same `uv`, and magnified textures
+cover many pixels per texel. So before scattering, each program sums the gradients of pixels
+that share the lowest remaining texel address, for two rounds, and writes each group with one
+atomic. Zero gradients, such as from masked-out background, are not written.
+
 ## Gradients
 
 - Through `rasterize`, gradients flow from `(u, v, z / w)` and `rast_db` into the vertex positions

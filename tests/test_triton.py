@@ -232,3 +232,108 @@ class TestInterpolate:
         attr, rast, rast_db, tri = self.scene(3, "shared")
         dr.interpolate(attr, rast, tri, rast_db=rast_db, diff_attrs="all")
         assert calls
+
+
+class TestTexture:
+    FILTERS = ("nearest", "linear", "linear-mipmap-nearest", "linear-mipmap-linear")
+    BOUNDARIES = ("wrap", "clamp", "zero")
+
+    def scene(self, tex_batch=2, channels=3, size=(37, 50), seed=0, dtype=torch.float32):
+        gen = torch.Generator().manual_seed(seed)
+        tex = torch.randn(tex_batch, *size, channels, generator=gen, dtype=dtype).cuda()
+        uv = (torch.rand(2, 20, 24, 2, generator=gen, dtype=dtype) * 1.6 - 0.3).cuda()
+        uv_da = (torch.rand(2, 20, 24, 4, generator=gen, dtype=dtype) * 0.2 - 0.1).cuda()
+        return tex, uv, uv_da
+
+    @pytest.mark.parametrize("boundary", BOUNDARIES)
+    @pytest.mark.parametrize("filter_mode", FILTERS)
+    @pytest.mark.parametrize("tex_batch, channels", [(1, 1), (2, 3), (2, 20)])
+    def test_forward_matches_reference(self, filter_mode, boundary, tex_batch, channels):
+        tex, uv, uv_da = self.scene(tex_batch, channels)
+        uv_da = uv_da if "mipmap" in filter_mode else None
+        ref = reference.texture(tex, uv, uv_da, filter_mode, boundary, None)
+        out = triton_backend.texture(tex, uv, uv_da, filter_mode, boundary, None)
+        torch.testing.assert_close(out, ref, atol=2e-5, rtol=2e-5)
+
+    @pytest.mark.parametrize("max_mip_level", [0, 2])
+    def test_max_mip_level(self, max_mip_level):
+        tex, uv, uv_da = self.scene()
+        ref = reference.texture(tex, uv, uv_da * 4, "linear-mipmap-linear", "wrap", max_mip_level)
+        out = triton_backend.texture(
+            tex, uv, uv_da * 4, "linear-mipmap-linear", "wrap", max_mip_level
+        )
+        torch.testing.assert_close(out, ref, atol=2e-5, rtol=2e-5)
+
+    @pytest.mark.parametrize("boundary", BOUNDARIES)
+    @pytest.mark.parametrize("filter_mode", FILTERS)
+    def test_gradients_match_reference(self, filter_mode, boundary):
+        tex, uv, uv_da = self.scene(channels=4, seed=1)
+        weights = torch.randn(2, 20, 24, 4, generator=torch.Generator().manual_seed(2)).cuda()
+        mip = "mipmap" in filter_mode
+
+        grads = []
+        for backend in (reference, triton_backend):
+            inputs = [t.clone().requires_grad_(True) for t in (tex, uv, uv_da)]
+            out = backend.texture(
+                inputs[0], inputs[1], inputs[2] if mip else None, filter_mode, boundary, None
+            )
+            (out * weights).sum().backward()
+            grads.append([t.grad if t.grad is not None else torch.zeros_like(t) for t in inputs])
+        for ours, ref in zip(grads[1], grads[0], strict=True):
+            torch.testing.assert_close(ours, ref, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("filter_mode", FILTERS)
+    def test_gradcheck_float64(self, filter_mode):
+        tex, uv, uv_da = self.scene(channels=2, size=(6, 7), seed=3, dtype=torch.float64)
+        uv, uv_da = uv[:, :3, :3].contiguous(), uv_da[:, :3, :3].contiguous()
+        # Footprints of 1.2 to 3.2 texels keep the level of detail away from integers and clamps.
+        scale = (torch.rand(2, 3, 3, 1, generator=torch.Generator().manual_seed(4)) * 2 + 1.2) / 7
+        uv_da = scale.double().cuda() * torch.tensor([1.0, 0.1, -0.2, 0.9]).double().cuda()
+        mip = "mipmap" in filter_mode
+        inputs = [t.clone().requires_grad_(True) for t in (tex, uv, uv_da)]
+        if filter_mode == "nearest":
+            inputs[1].requires_grad_(False)
+        assert torch.autograd.gradcheck(
+            lambda t, c, d: triton_backend.texture(
+                t, c, d if mip else None, filter_mode, "wrap", None
+            ),
+            inputs,
+        )
+
+    @pytest.mark.parametrize("filter_mode", FILTERS)
+    @pytest.mark.parametrize("pattern", ["constant", "magnified", "mixed"])
+    def test_gradients_where_pixels_share_texels(self, filter_mode, pattern):
+        # Many pixels adding into the same texels exercises the in-register pre-reduction.
+        tex, uv, uv_da = self.scene(channels=3, seed=5)
+        if pattern == "constant":
+            uv = torch.full_like(uv, 0.3)
+        elif pattern == "magnified":
+            uv = uv / 16 + 0.4
+        else:
+            uv[:, ::2] = 0.0
+        mip = "mipmap" in filter_mode
+        grads = []
+        for backend in (reference, triton_backend):
+            t = tex.clone().requires_grad_(True)
+            backend.texture(
+                t, uv, uv_da if mip else None, filter_mode, "clamp", None
+            ).sum().backward()
+            grads.append(t.grad)
+        torch.testing.assert_close(grads[1], grads[0], atol=1e-3, rtol=1e-4)
+
+    @pytest.mark.parametrize("filter_mode", ["nearest", "linear", "linear-mipmap-nearest"])
+    def test_unused_uv_da_gets_no_gradient(self, filter_mode):
+        tex, uv, uv_da = self.scene()
+        uv_da.requires_grad_(True)
+        triton_backend.texture(tex, uv, uv_da, filter_mode, "wrap", None).sum().backward()
+        assert uv_da.grad is None or (uv_da.grad == 0).all()
+
+    def test_auto_backend_uses_triton(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            triton_backend, "texture", lambda *args: calls.append(1) or reference.texture(*args)
+        )
+        monkeypatch.setattr(backends, "_selected", "auto")
+        tex, uv, uv_da = self.scene()
+        dr.texture(tex, uv, uv_da)
+        assert calls
