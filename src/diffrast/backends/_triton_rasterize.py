@@ -1,10 +1,17 @@
 """Visibility pass of the Triton rasterizer.
 
-Triangles are set up and binned into screen tiles with PyTorch ops. The Triton kernel then runs
-one program per (tile, chunk of that tile's triangles): each program finds the nearest covering
-triangle per pixel in registers and merges it into a shared buffer with a 64-bit atomic min on
-``(depth, triangle id)`` packed into one integer. Coverage and depth use the same homogeneous
-formulation as the reference backend.
+The output is a buffer of 64-bit keys, one per pixel, that pack ``(depth, triangle id)`` so that a
+single atomic min keeps the nearest triangle and resolves equal depths to the lower id.
+
+1. ``_setup_kernel`` runs per triangle: it culls, computes the pixel bounding box, and rasterizes
+   triangles whose box fits in ``SMALL x SMALL`` pixels directly with atomics. For every other
+   visible triangle it writes the range of screen tiles to visit.
+2. Those larger triangles are binned into tiles with PyTorch ops, and each tile's list is cut into
+   chunks of ``CHUNK`` triangles.
+3. ``_tile_kernel`` runs one program per chunk, keeps the nearest hit per pixel in registers, and
+   merges it into the buffer with one atomic per pixel.
+
+Coverage and depth use the same homogeneous formulation as the reference backend.
 """
 
 from __future__ import annotations
@@ -17,15 +24,143 @@ from torch import Tensor
 from diffrast.backends.reference import pixel_centres
 
 TILE = 16
-# Triangles per program. Tiles with more triangles are split across programs.
+# Triangles per tile program. Tiles with more triangles are split across programs.
 CHUNK = 64
+# Triangles whose pixel bounding box fits in SMALL x SMALL skip binning.
+SMALL = 4
+# Triangles per setup program.
+SETUP_BLOCK = 128
 
 _EMPTY = torch.iinfo(torch.int64).max
 
 
 @triton.jit
-def _coverage_kernel(
-    verts_ptr,
+def _load_vertex(pos_ptr, tri_ptr, b, t, k, num_vert, mask):
+    i = tl.load(tri_ptr + t * 3 + k, mask=mask, other=0).to(tl.int64)
+    base = pos_ptr + (b * num_vert + i) * 4
+    x = tl.load(base, mask=mask, other=0.0)
+    y = tl.load(base + 1, mask=mask, other=0.0)
+    z = tl.load(base + 2, mask=mask, other=0.0)
+    w = tl.load(base + 3, mask=mask, other=0.0)
+    return x, y, z, w
+
+
+@triton.jit
+def _depth_key(x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2, px, py, t):
+    """Packed ``(depth, t)`` key where the pixel ``(px, py)`` is covered, else the empty key."""
+    a0, a1, a2 = x0 - px * w0, x1 - px * w1, x2 - px * w2
+    c0, c1, c2 = y0 - py * w0, y1 - py * w1, y2 - py * w2
+    e0 = a1 * c2 - a2 * c1
+    e1 = a2 * c0 - a0 * c2
+    e2 = a0 * c1 - a1 * c0
+    s = e0 + e1 + e2
+    ew = e0 * w0 + e1 * w1 + e2 * w2
+    depth = (e0 * z0 + e1 * z1 + e2 * z2) / ew
+    inside = (s != 0) & (e0 * s >= 0) & (e1 * s >= 0) & (e2 * s >= 0) & (ew * s > 0)
+    inside = inside & (depth >= -1.0) & (depth <= 1.0)
+
+    # Map the float's bits to an integer with the same ordering.
+    bits = depth.to(tl.int32, bitcast=True)
+    ordered = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
+    ordered = tl.where(depth == 0.0, 0, ordered)
+    key = (ordered.to(tl.int64) << 32) | t
+    return tl.where(inside, key, 0x7FFFFFFFFFFFFFFF)
+
+
+@triton.jit
+def _pixel_range(lo, hi, size):
+    """Indices of the pixel centres within ``[lo, hi]`` in NDC, as an inclusive range."""
+    # The margin keeps centres on the boundary despite rounding; extra pixels are tested exactly.
+    first = tl.math.ceil(((lo + 1.0) * size - 1.0) * 0.5 - 1e-3)
+    last = tl.math.floor(((hi + 1.0) * size - 1.0) * 0.5 + 1e-3)
+    first = tl.minimum(tl.maximum(first, 0.0), size * 1.0)
+    last = tl.minimum(tl.maximum(last, -1.0), size - 1.0)
+    return first.to(tl.int32), last.to(tl.int32)
+
+
+@triton.jit
+def _setup_kernel(
+    pos_ptr,
+    tri_ptr,
+    px_ptr,
+    py_ptr,
+    out_ptr,
+    tile_box_ptr,
+    total,
+    num_tri,
+    num_vert,
+    height,
+    width,
+    TILE: tl.constexpr,
+    SMALL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    g = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    valid = g < total
+    b, t = g // num_tri, g % num_tri
+    x0, y0, z0, w0 = _load_vertex(pos_ptr, tri_ptr, b, t, 0, num_vert, valid)
+    x1, y1, z1, w1 = _load_vertex(pos_ptr, tri_ptr, b, t, 1, num_vert, valid)
+    x2, y2, z2, w2 = _load_vertex(pos_ptr, tri_ptr, b, t, 2, num_vert, valid)
+
+    # Every point on a triangle is a non-negative combination of its vertices, so it is invisible
+    # when all vertices are behind the camera or outside the same clip plane.
+    culled = (w0 <= 0) & (w1 <= 0) & (w2 <= 0)
+    culled |= (x0 > w0) & (x1 > w1) & (x2 > w2)
+    culled |= (x0 < -w0) & (x1 < -w1) & (x2 < -w2)
+    culled |= (y0 > w0) & (y1 > w1) & (y2 > w2)
+    culled |= (y0 < -w0) & (y1 < -w1) & (y2 < -w2)
+    culled |= (z0 > w0) & (z1 > w1) & (z2 > w2)
+    culled |= (z0 < -w0) & (z1 < -w1) & (z2 < -w2)
+
+    # Triangles in front of the camera are bounded by their projected vertices. Ones crossing the
+    # camera plane project to an unbounded region and cover the whole screen.
+    in_front = (w0 > 0) & (w1 > 0) & (w2 > 0)
+    sw0, sw1, sw2 = (
+        tl.where(in_front, w0, 1.0),
+        tl.where(in_front, w1, 1.0),
+        tl.where(in_front, w2, 1.0),
+    )
+    nx0, nx1, nx2 = x0 / sw0, x1 / sw1, x2 / sw2
+    ny0, ny1, ny2 = y0 / sw0, y1 / sw1, y2 / sw2
+    col0, col1 = _pixel_range(
+        tl.minimum(tl.minimum(nx0, nx1), nx2), tl.maximum(tl.maximum(nx0, nx1), nx2), width
+    )
+    row0, row1 = _pixel_range(
+        tl.minimum(tl.minimum(ny0, ny1), ny2), tl.maximum(tl.maximum(ny0, ny1), ny2), height
+    )
+    col0, col1 = tl.where(in_front, col0, 0), tl.where(in_front, col1, width - 1)
+    row0, row1 = tl.where(in_front, row0, 0), tl.where(in_front, row1, height - 1)
+
+    visible = valid & ~culled & (col0 <= col1) & (row0 <= row1)
+    small = visible & in_front & (col1 - col0 < SMALL) & (row1 - row0 < SMALL)
+
+    lane = tl.arange(0, SMALL * SMALL)[None, :]
+    col = col0[:, None] + lane % SMALL
+    row = row0[:, None] + lane // SMALL
+    lane_ok = small[:, None] & (col <= col1[:, None]) & (row <= row1[:, None])
+    px = tl.load(px_ptr + col, mask=lane_ok, other=0.0)
+    py = tl.load(py_ptr + row, mask=lane_ok, other=0.0)
+    key = _depth_key(
+        x0[:, None], y0[:, None], z0[:, None], w0[:, None],
+        x1[:, None], y1[:, None], z1[:, None], w1[:, None],
+        x2[:, None], y2[:, None], z2[:, None], w2[:, None],
+        px, py, t[:, None],
+    )  # fmt: skip
+    offs = (b[:, None] * height + row) * width + col
+    tl.atomic_min(out_ptr + offs, key, mask=lane_ok & (key != 0x7FFFFFFFFFFFFFFF))
+
+    large = visible & ~small
+    box = tile_box_ptr + g * 4
+    tl.store(box, tl.where(large, col0 // TILE, -1), mask=valid)
+    tl.store(box + 1, col1 // TILE, mask=valid)
+    tl.store(box + 2, row0 // TILE, mask=valid)
+    tl.store(box + 3, row1 // TILE, mask=valid)
+
+
+@triton.jit
+def _tile_kernel(
+    pos_ptr,
+    tri_ptr,
     tri_list_ptr,
     item_tile_ptr,
     item_start_ptr,
@@ -34,6 +169,7 @@ def _coverage_kernel(
     py_ptr,
     out_ptr,
     num_tri,
+    num_vert,
     height,
     width,
     tiles_x,
@@ -55,34 +191,12 @@ def _coverage_kernel(
     best = tl.full((TILE, TILE), 0x7FFFFFFFFFFFFFFF, tl.int64)
     for i in range(start, end):
         g = tl.load(tri_list_ptr + i).to(tl.int64)
-        base = verts_ptr + g * 12
-        x0, y0, z0, w0 = tl.load(base), tl.load(base + 1), tl.load(base + 2), tl.load(base + 3)
-        x1, y1, z1, w1 = tl.load(base + 4), tl.load(base + 5), tl.load(base + 6), tl.load(base + 7)
-        x2, y2, z2, w2 = (
-            tl.load(base + 8),
-            tl.load(base + 9),
-            tl.load(base + 10),
-            tl.load(base + 11),
-        )
-
-        a0, a1, a2 = x0 - px * w0, x1 - px * w1, x2 - px * w2
-        c0, c1, c2 = y0 - py * w0, y1 - py * w1, y2 - py * w2
-        e0 = a1 * c2 - a2 * c1
-        e1 = a2 * c0 - a0 * c2
-        e2 = a0 * c1 - a1 * c0
-        s = e0 + e1 + e2
-        ew = e0 * w0 + e1 * w1 + e2 * w2
-        depth = (e0 * z0 + e1 * z1 + e2 * z2) / ew
-        inside = (s != 0) & (e0 * s >= 0) & (e1 * s >= 0) & (e2 * s >= 0) & (ew * s > 0)
-        inside = inside & (depth >= -1.0) & (depth <= 1.0)
-
-        # Map the float's bits to an integer with the same ordering, then append the id so
-        # equal depths resolve to the lower triangle index.
-        bits = depth.to(tl.int32, bitcast=True)
-        ordered = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
-        ordered = tl.where(depth == 0.0, 0, ordered)
-        key = (ordered.to(tl.int64) << 32) | (g % num_tri)
-        best = tl.minimum(best, tl.where(inside, key, 0x7FFFFFFFFFFFFFFF))
+        b, t = g // num_tri, g % num_tri
+        x0, y0, z0, w0 = _load_vertex(pos_ptr, tri_ptr, b, t, 0, num_vert, True)
+        x1, y1, z1, w1 = _load_vertex(pos_ptr, tri_ptr, b, t, 1, num_vert, True)
+        x2, y2, z2, w2 = _load_vertex(pos_ptr, tri_ptr, b, t, 2, num_vert, True)
+        key = _depth_key(x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2, px, py, t)
+        best = tl.minimum(best, key)
 
     offs = (image * height + row) * width + col
     mask = (row < height) & (col < width) & (best != 0x7FFFFFFFFFFFFFFF)
@@ -92,79 +206,51 @@ def _coverage_kernel(
 def visible_triangles(pos: Tensor, tri: Tensor, resolution: tuple[int, int]) -> Tensor:
     """Index of the nearest covering triangle per pixel, ``[batch, height, width]``, or -1."""
     height, width = resolution
-    batch, num_tri = pos.shape[0], tri.shape[0]
+    batch, num_vert = pos.shape[:2]
+    num_tri = tri.shape[0]
     device = pos.device
-    pos = pos.detach().float()
-    tri = tri.long()
-
-    verts = pos[:, tri]
-    tile_lists = _bin_triangles(verts, height, width)
+    pos = pos.detach().float().contiguous()
+    tri = tri.to(torch.int32).contiguous()
+    px, py = pixel_centres(height, width, pos)
     out = torch.full((batch, height, width), _EMPTY, dtype=torch.int64, device=device)
-    if tile_lists is not None:
-        tri_list, item_tile, item_start, item_end, tiles_x, tiles_per_image = tile_lists
-        px, py = pixel_centres(height, width, pos)
-        with torch.cuda.device(device):
-            _coverage_kernel[(item_tile.shape[0],)](
-                verts.reshape(-1, 12).contiguous(),
-                tri_list,
-                item_tile,
-                item_start,
-                item_end,
-                px,
-                py,
-                out,
-                num_tri,
-                height,
-                width,
-                tiles_x,
-                tiles_per_image,
-                TILE=TILE,
-            )
+    total = batch * num_tri
+    tile_box = torch.empty(total, 4, dtype=torch.int32, device=device)
+
+    with torch.cuda.device(device):
+        _setup_kernel[(triton.cdiv(total, SETUP_BLOCK),)](
+            pos, tri, px, py, out, tile_box, total, num_tri, num_vert, height, width,
+            TILE=TILE, SMALL=SMALL, BLOCK=SETUP_BLOCK,
+        )  # fmt: skip
+
+        lists = _bin_triangles(tile_box, batch, height, width)
+        if lists is not None:
+            tri_list, item_tile, item_start, item_end, tiles_x, tiles_per_image = lists
+            _tile_kernel[(item_tile.shape[0],)](
+                pos, tri, tri_list, item_tile, item_start, item_end, px, py, out,
+                num_tri, num_vert, height, width, tiles_x, tiles_per_image, TILE=TILE,
+            )  # fmt: skip
     return torch.where(out == _EMPTY, -1, out & 0xFFFFFFFF)
 
 
-def _bin_triangles(verts: Tensor, height: int, width: int):
-    """Assign triangles to the screen tiles their bounding boxes overlap.
+def _bin_triangles(tile_box: Tensor, batch: int, height: int, width: int):
+    """Assign the triangles marked for tiling to the screen tiles their bounding boxes overlap.
 
-    Returns ``(tri_list, item_tile, item_start, item_end, tiles_x, tiles_per_image)``, where
-    ``tri_list`` holds flat ``batch * num_tri + tri`` indices grouped by tile, and each work item
-    covers ``tri_list[item_start:item_end]`` for tile ``item_tile``. Returns ``None`` when no
-    triangle can be visible.
+    ``tile_box`` holds ``(first, last)`` tile columns and rows per triangle, with ``first`` column
+    -1 for triangles that need no tiling. Returns ``(tri_list, item_tile, item_start, item_end,
+    tiles_x, tiles_per_image)``, where ``tri_list`` holds flat ``batch * num_tri + tri`` indices
+    grouped by tile, and each work item covers ``tri_list[item_start:item_end]`` of tile
+    ``item_tile``. Returns ``None`` when there is nothing to tile.
     """
-    batch, num_tri = verts.shape[:2]
-    device = verts.device
-    x, y, z, w = verts.unbind(-1)
-
-    # A triangle is invisible when all vertices lie behind the camera or outside the same clip
-    # plane, since every point on it is a non-negative combination of its vertices.
-    culled = (w <= 0).all(-1)
-    for c in (x, y, z):
-        culled |= (c > w).all(-1) | (c < -w).all(-1)
-
-    # Triangles fully in front of the camera are bounded by their projected vertices. Ones that
-    # cross the camera plane project to an unbounded region and get the whole screen.
-    in_front = (w > 0).all(-1)
-    safe_w = torch.where(in_front[..., None], w, 1.0)
-    ndc_x, ndc_y = x / safe_w, y / safe_w
-    col_min = _to_pixel(ndc_x.amin(-1), width).floor() - 1
-    col_max = _to_pixel(ndc_x.amax(-1), width).ceil() + 1
-    row_min = _to_pixel(ndc_y.amin(-1), height).floor() - 1
-    row_max = _to_pixel(ndc_y.amax(-1), height).ceil() + 1
-    col_min = torch.where(in_front, col_min.clamp(0, width - 1), 0).long()
-    col_max = torch.where(in_front, col_max.clamp(0, width - 1), width - 1).long()
-    row_min = torch.where(in_front, row_min.clamp(0, height - 1), 0).long()
-    row_max = torch.where(in_front, row_max.clamp(0, height - 1), height - 1).long()
-
+    device = tile_box.device
+    num_tri = tile_box.shape[0] // batch
     tiles_x = triton.cdiv(width, TILE)
     tiles_y = triton.cdiv(height, TILE)
     tiles_per_image = tiles_x * tiles_y
-    tx0, tx1 = col_min // TILE, col_max // TILE
-    ty0, ty1 = row_min // TILE, row_max // TILE
 
-    b_idx, t_idx = (~culled).nonzero(as_tuple=True)
-    if b_idx.numel() == 0:
+    g = (tile_box[:, 0] >= 0).nonzero().squeeze(1)
+    if g.numel() == 0:
         return None
-    tx0, tx1, ty0, ty1 = tx0[b_idx, t_idx], tx1[b_idx, t_idx], ty0[b_idx, t_idx], ty1[b_idx, t_idx]
+    tx0, tx1, ty0, ty1 = tile_box[g].long().unbind(-1)
     span_x = tx1 - tx0 + 1
     counts = span_x * (ty1 - ty0 + 1)
 
@@ -172,13 +258,18 @@ def _bin_triangles(verts: Tensor, height: int, width: int):
     local = torch.arange(owner.shape[0], device=device) - (counts.cumsum(0) - counts)[owner]
     tile_x = tx0[owner] + local % span_x[owner]
     tile_y = ty0[owner] + local // span_x[owner]
-    tile = (b_idx[owner] * tiles_y + tile_y) * tiles_x + tile_x
+    tile = (g[owner] // num_tri * tiles_y + tile_y) * tiles_x + tile_x
 
-    order = torch.argsort(tile, stable=True)
-    tri_list = (b_idx * num_tri + t_idx)[owner][order].to(torch.int32)
+    sorted_tile, order = torch.sort(tile, stable=True)
+    tri_list = g[owner][order].to(torch.int32)
 
-    tile_count = torch.bincount(tile, minlength=batch * tiles_per_image)
-    tile_start = tile_count.cumsum(0) - tile_count
+    # Binary search on the sorted list instead of bincount, whose atomics contend heavily when
+    # many triangles share few tiles.
+    bounds = torch.searchsorted(
+        sorted_tile, torch.arange(batch * tiles_per_image + 1, device=device)
+    )
+    tile_start = bounds[:-1]
+    tile_count = bounds[1:] - tile_start
     chunks = (tile_count + CHUNK - 1) // CHUNK
     item_tile = torch.repeat_interleave(torch.arange(chunks.shape[0], device=device), chunks)
     item_chunk = (
@@ -194,8 +285,3 @@ def _bin_triangles(verts: Tensor, height: int, width: int):
         tiles_x,
         tiles_per_image,
     )
-
-
-def _to_pixel(ndc: Tensor, size: int) -> Tensor:
-    """Inverse of the pixel-centre mapping ``ndc = (2 * i + 1) / size - 1``."""
-    return ((ndc + 1) * size - 1) / 2

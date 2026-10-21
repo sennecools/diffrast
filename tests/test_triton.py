@@ -21,6 +21,25 @@ def random_mesh(num_tri, gen, z_range=0.9, w_range=(1.0, 2.0), xy_range=1.2, bat
     return pos, tri
 
 
+def tiny_mesh(num_tri, gen, size, batch=1):
+    """Triangles about ``size`` NDC units across, scattered over and just past the screen."""
+    centre = torch.rand(batch, num_tri, 1, 2, generator=gen) * 2.2 - 1.1
+    offset = (torch.rand(batch, num_tri, 3, 2, generator=gen) * 2 - 1) * size
+    xy = (centre + offset).reshape(batch, 3 * num_tri, 2)
+    z = torch.rand(batch, 3 * num_tri, 1, generator=gen) * 1.8 - 0.9
+    w = torch.rand(batch, 3 * num_tri, 1, generator=gen) + 1.0
+    pos = torch.cat([xy * w, z * w, w], -1).cuda()
+    tri = torch.arange(3 * num_tri, dtype=torch.int32).view(num_tri, 3).cuda()
+    return pos, tri
+
+
+def mixed_mesh(gen):
+    small_pos, small_tri = tiny_mesh(2000, gen, size=0.04, batch=2)
+    large_pos, large_tri = random_mesh(40, gen, batch=2)
+    pos = torch.cat([small_pos, large_pos], 1)
+    return pos, torch.cat([small_tri, large_tri + small_pos.shape[1]])
+
+
 def assert_matches_reference(pos, tri, resolution, max_mismatch=0.0):
     ref, ref_db = reference.rasterize(pos, tri, resolution, True)
     out, out_db = triton_backend.rasterize(pos, tri, resolution, True)
@@ -115,3 +134,25 @@ def test_gradients_match_reference():
         ((rast[..., :3] * weights[..., :3]).sum() + (rast_db * weights).sum()).backward()
         grads.append(p.grad)
     torch.testing.assert_close(grads[1], grads[0])
+
+
+def test_tiny_triangles():
+    gen = torch.Generator().manual_seed(6)
+    pos, tri = tiny_mesh(3000, gen, size=0.03, batch=2)
+    ref = assert_matches_reference(pos, tri, (64, 64), max_mismatch=1e-3)
+    assert (ref[..., 3] > 0).float().mean() > 0.1
+
+
+def test_mixed_triangle_sizes():
+    gen = torch.Generator().manual_seed(7)
+    pos, tri = mixed_mesh(gen)
+    assert_matches_reference(pos, tri, (96, 80), max_mismatch=1e-3)
+
+
+@pytest.mark.parametrize("small", [1, 2, 8])
+def test_small_triangle_threshold_does_not_change_result(monkeypatch, small):
+    # 1 sends nearly everything through tile binning, 8 nearly everything through the direct path.
+    monkeypatch.setattr(_triton_rasterize, "SMALL", small)
+    gen = torch.Generator().manual_seed(7)
+    pos, tri = mixed_mesh(gen)
+    assert_matches_reference(pos, tri, (96, 80), max_mismatch=1e-3)

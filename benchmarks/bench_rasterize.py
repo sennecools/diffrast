@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import statistics
 import time
 
 import torch
@@ -51,18 +52,26 @@ def grid_mesh(num_tri: int, views: int, device: torch.device) -> tuple[torch.Ten
     return torch.stack(views_pos), tri.to(torch.int32)
 
 
-def time_ms(fn, repeats: int, warmup: int = 3) -> float:
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
+def time_ms(fn, repeats: int, warmup_s: float) -> float:
+    # Warm up for a fixed time rather than a fixed count: on some drivers (ROCm on Windows), newly
+    # allocated memory stays slow for several seconds before it settles.
     start = time.perf_counter()
-    for _ in range(repeats):
+    while True:
         fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - start) / repeats * 1000
+        torch.cuda.synchronize()
+        if time.perf_counter() - start > warmup_s:
+            break
+    # Median of individually timed calls, so occasional stalls do not skew the result.
+    times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - start)
+    return statistics.median(times) * 1000
 
 
-def measure(ctx, pos, tri, res: int, repeats: int) -> tuple[float, float]:
+def measure(ctx, pos, tri, res: int, repeats: int, warmup_s: float) -> tuple[float, float]:
     """Return forward and forward + backward time in milliseconds."""
     pos = pos.clone().requires_grad_(True)
 
@@ -74,7 +83,7 @@ def measure(ctx, pos, tri, res: int, repeats: int) -> tuple[float, float]:
         rast, rast_db = dr.rasterize(ctx, pos, tri, (res, res))
         (rast[..., :3].sum() + rast_db.sum()).backward()
 
-    return time_ms(forward, repeats), time_ms(forward_backward, repeats)
+    return time_ms(forward, repeats, warmup_s), time_ms(forward_backward, repeats, warmup_s)
 
 
 def main() -> None:
@@ -84,6 +93,7 @@ def main() -> None:
     parser.add_argument("--resolutions", nargs="+", type=int, default=[512, 1024, 2048])
     parser.add_argument("--views", nargs="+", type=int, default=[1, 8])
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--warmup", type=float, default=15.0, help="warmup seconds per case")
     parser.add_argument("--memory-fraction", type=float, default=0.5)
     parser.add_argument("--max-reference-work", type=float, default=2e10)
     args = parser.parse_args()
@@ -105,11 +115,11 @@ def main() -> None:
                         continue
                     dr.set_backend(backend)
                     try:
-                        fwd, fwd_bwd = measure(ctx, pos, tri, res, args.repeats)
+                        fwd, fwd_bwd = measure(ctx, pos, tri, res, args.repeats, args.warmup)
                         times = (f"{fwd:.2f}", f"{fwd_bwd:.2f}")
                     except torch.OutOfMemoryError:
                         times = ("OOM", "OOM")
-                    torch.cuda.empty_cache()
+                        torch.cuda.empty_cache()
                     print(row.format(backend, tri.shape[0], res, views, *times))
 
 

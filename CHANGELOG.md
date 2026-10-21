@@ -14,6 +14,9 @@ All notable changes to this project are documented here. The format is based on
   attributes and barycentrics, and screen-space derivatives (`rast_db`, `out_da`).
 - Triton `rasterize`: tile binning and a coverage kernel that merges depth with 64-bit atomics.
   Matches the reference backend pixel for pixel on the test scenes.
+- Triton `rasterize` draws triangles with a pixel bounding box of at most 4 x 4 directly, without
+  tile binning. On an RX 9070 XT, a 1M-triangle mesh at 8 views and 512 x 512 goes from about
+  220 ms to 6 ms forward.
 - `benchmarks/bench_rasterize.py`.
 
 ### Changed

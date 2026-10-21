@@ -57,22 +57,31 @@ The Triton backend replaces only the visibility pass; `rast` and `rast_db` are t
 same differentiable code as the reference backend (`reference.rasterize_from_ids`), so gradients
 are identical by construction.
 
-1. **Setup** (PyTorch). A triangle is culled when all its vertices have `w <= 0`, or all lie
-   outside the same clip plane (`x > w`, `x < -w`, and so on), since every point on it is a
-   non-negative combination of its vertices. Triangles entirely in front of the camera are
-   bounded by their projected vertices; triangles crossing the camera plane get the whole screen.
-   Back-facing and degenerate triangles are not culled here.
-2. **Binning** (PyTorch). The image is split into 16 x 16 tiles. Each triangle is added to every
-   tile its bounding box overlaps, and the pairs are sorted by tile. Each tile's list is cut into
-   work items of up to 64 triangles.
-3. **Coverage and depth** (`_triton_rasterize._coverage_kernel`). One program per work item
-   evaluates the homogeneous edge functions for its 256 pixels and keeps the nearest hit in
-   registers. Programs that share a tile merge results with a 64-bit `atomic_min` on a key that
-   packs the depth (as an order-preserving integer) in the high 32 bits and the triangle index in
-   the low 32 bits, which also resolves equal depths to the lower index.
+All paths write to one buffer of 64-bit keys per pixel. A key packs the depth (as an
+order-preserving integer) in the high 32 bits and the triangle index in the low 32 bits, so a
+single `atomic_min` keeps the nearest triangle and resolves equal depths to the lower index.
 
-The coverage and depth tests use the same formulas as the reference backend, and on the test
-scenes both backends pick the same triangle for every pixel.
+1. **Setup** (`_setup_kernel`, one lane per triangle). A triangle is culled when all its vertices
+   have `w <= 0`, or all lie outside the same clip plane (`x > w`, `x < -w`, and so on), since
+   every point on it is a non-negative combination of its vertices. Triangles entirely in front of
+   the camera are bounded by the pixel centres inside their projected bounding box; triangles
+   crossing the camera plane get the whole screen. Back-facing and degenerate triangles are not
+   culled.
+2. **Small triangles** (same kernel). A triangle whose box fits in 4 x 4 pixels is rasterized
+   right away: 16 lanes test those pixels and write hits with `atomic_min`. Dense meshes at
+   moderate resolutions are mostly such triangles, and they skip binning entirely.
+3. **Binning** (PyTorch, larger triangles only). The image is split into 16 x 16 tiles. Each
+   triangle is added to every tile its box overlaps, the pairs are sorted by tile, and each tile's
+   list is cut into work items of up to 64 triangles. Tile ranges come from a binary search on
+   the sorted list; `bincount` was much slower on ROCm because its atomics contend when many
+   triangles share few tiles.
+4. **Coverage and depth** (`_tile_kernel`). One program per work item evaluates the homogeneous
+   edge functions for its 256 pixels, keeps the nearest hit in registers, and merges it into the
+   buffer with one `atomic_min` per pixel.
+
+Both kernels read vertices through `tri` directly from `pos`, so no per-triangle copy of the
+vertex data is made. The coverage and depth tests use the same formulas as the reference backend,
+and on the test scenes both backends pick the same triangle for every pixel.
 
 ## Gradients
 
