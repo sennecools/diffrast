@@ -46,10 +46,13 @@ def texture(
     filter_mode: str,
     boundary_mode: str,
     max_mip_level: int | None,
+    mip_level_bias: Tensor | None = None,
 ) -> Tensor:
     from diffrast.backends import _triton_texture
 
-    return _triton_texture.texture(tex, uv, uv_da, filter_mode, boundary_mode, max_mip_level)
+    return _triton_texture.texture(
+        tex, uv, uv_da, filter_mode, boundary_mode, max_mip_level, mip_level_bias
+    )
 
 
 def antialias(

@@ -61,7 +61,7 @@ loss.backward()  # gradients reach tex and pos_clip
 Function names, argument names and argument order follow nvdiffrast's documented API, and
 `RasterizeCudaContext` is an alias of `RasterizeContext`, so most code ports by changing the
 import to `import diffrast as dr`. Not yet supported: the OpenGL context, range mode, depth
-peeling, cube-map textures, `mip_level_bias` and precomputed `mip` stacks.
+peeling, cube-map textures and precomputed `mip` stacks.
 
 ### Backends
 

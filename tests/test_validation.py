@@ -69,11 +69,18 @@ def test_texture_rejects_unknown_modes():
         dr.texture(tex, uv, boundary_mode="mirror")
 
 
-def test_texture_rejects_unsupported_mip_options():
+def test_texture_rejects_precomputed_mips():
     tex = torch.zeros(1, 16, 16, 3)
     uv = torch.zeros(1, 8, 8, 2)
-    with pytest.raises(NotImplementedError, match="mip_level_bias"):
-        dr.texture(tex, uv, mip_level_bias=torch.zeros(1, 8, 8))
+    with pytest.raises(NotImplementedError, match="mip="):
+        dr.texture(tex, uv, mip=[tex])
+
+
+def test_texture_checks_mip_level_bias_shape():
+    tex = torch.zeros(1, 16, 16, 3)
+    uv = torch.zeros(1, 8, 8, 2)
+    with pytest.raises(ValueError, match="mip_level_bias must match uv"):
+        dr.texture(tex, uv, mip_level_bias=torch.zeros(1, 8, 4))
 
 
 def test_antialias_rejects_mismatched_color(triangle):

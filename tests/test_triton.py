@@ -334,10 +334,35 @@ class TestTexture:
         triton_backend.texture(tex, uv, uv_da, filter_mode, "wrap", None).sum().backward()
         assert uv_da.grad is None or (uv_da.grad == 0).all()
 
+    @pytest.mark.parametrize("filter_mode", ["linear-mipmap-nearest", "linear-mipmap-linear"])
+    @pytest.mark.parametrize("with_da", [True, False])
+    def test_mip_level_bias_matches_reference(self, filter_mode, with_da):
+        tex, uv, uv_da = self.scene(channels=3, seed=6)
+        uv_da = uv_da if with_da else None
+        bias = torch.rand(2, 20, 24, generator=torch.Generator().manual_seed(7)).cuda() * 4 - 1
+        weights = torch.randn(2, 20, 24, 3, generator=torch.Generator().manual_seed(8)).cuda()
+
+        results = []
+        for backend in (reference, triton_backend):
+            inputs = [t.clone().requires_grad_(True) for t in (tex, uv, bias)]
+            da = uv_da.clone().requires_grad_(True) if with_da else None
+            out = backend.texture(
+                inputs[0], inputs[1], da, filter_mode, "wrap", None, mip_level_bias=inputs[2]
+            )
+            (out * weights).sum().backward()
+            grads = [t.grad if t.grad is not None else torch.zeros_like(t) for t in inputs]
+            if with_da:
+                grads.append(da.grad if da.grad is not None else torch.zeros_like(da))
+            results.append([out.detach(), *grads])
+        for ours, ref in zip(results[1], results[0], strict=True):
+            torch.testing.assert_close(ours, ref, atol=1e-3, rtol=1e-3)
+
     def test_auto_backend_uses_triton(self, monkeypatch):
         calls = []
         monkeypatch.setattr(
-            triton_backend, "texture", lambda *args: calls.append(1) or reference.texture(*args)
+            triton_backend,
+            "texture",
+            lambda *args, **kwargs: calls.append(1) or reference.texture(*args, **kwargs),
         )
         monkeypatch.setattr(backends, "_selected", "auto")
         tex, uv, uv_da = self.scene()

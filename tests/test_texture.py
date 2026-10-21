@@ -151,6 +151,21 @@ class TestMipmaps:
         along_both[..., 3] = 0.5 / 6
         torch.testing.assert_close(dr.texture(tex, uv, along_x), dr.texture(tex, uv, along_both))
 
+    def test_bias_scales_the_footprint(self, tex):
+        # A bias of b selects the same level as a footprint 2**b times as large.
+        uv = torch.rand(1, 5, 5, 2, generator=torch.Generator().manual_seed(18))
+        bias = torch.full((1, 5, 5), 1.3)
+        shifted = dr.texture(tex, uv, footprint(uv, 1.2, 8), mip_level_bias=bias)
+        scaled = dr.texture(tex, uv, footprint(uv, 1.2 * 2**1.3, 8))
+        torch.testing.assert_close(shifted, scaled)
+
+    def test_bias_alone_sets_the_level(self, tex):
+        uv = torch.rand(1, 5, 5, 2, generator=torch.Generator().manual_seed(19))
+        bias = torch.full((1, 5, 5), 1.7)
+        direct = dr.texture(tex, uv, mip_level_bias=bias)
+        via_footprint = dr.texture(tex, uv, footprint(uv, 2**1.7, 8))
+        torch.testing.assert_close(direct, via_footprint)
+
     def test_odd_sizes_keep_constants(self):
         tex = torch.full((1, 5, 7, 2), 0.25)
         uv = torch.rand(1, 4, 4, 2, generator=torch.Generator().manual_seed(12))
@@ -191,6 +206,22 @@ class TestGradients:
         assert torch.autograd.gradcheck(
             lambda t, c, d: reference.texture(t, c, d, filter_mode, "wrap", None), (tex, uv, uv_da)
         )
+
+
+def test_mip_level_bias_gradcheck():
+    gen = torch.Generator().manual_seed(20)
+    tex = torch.randn(1, 4, 5, 2, generator=gen, dtype=torch.float64, requires_grad=True)
+    uv = torch.rand(1, 3, 3, 2, generator=gen, dtype=torch.float64, requires_grad=True)
+    # Levels of 0.2-0.8 and 1.2-1.8 stay away from integers and from the clamps.
+    frac = torch.rand(1, 3, 3, generator=gen, dtype=torch.float64) * 0.6 + 0.2
+    level = (torch.rand(1, 3, 3, generator=gen) < 0.5).double()
+    bias = (frac + level).requires_grad_()
+    assert torch.autograd.gradcheck(
+        lambda t, c, b: reference.texture(
+            t, c, None, "linear-mipmap-linear", "wrap", None, mip_level_bias=b
+        ),
+        (tex, uv, bias),
+    )
 
 
 def test_texture_fitting_recovers_target(ctx):

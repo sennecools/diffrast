@@ -121,6 +121,7 @@ def texture(
     filter_mode: str,
     boundary_mode: str,
     max_mip_level: int | None,
+    mip_level_bias: Tensor | None = None,
 ) -> Tensor:
     if filter_mode == "nearest":
         return _sample_nearest(tex, uv, boundary_mode)
@@ -128,7 +129,12 @@ def texture(
         return _sample_linear(tex, uv, boundary_mode)
 
     levels = _mip_chain(tex, max_mip_level)
-    lod = _level_of_detail(uv_da, tex.shape[1], tex.shape[2]).clamp(0, len(levels) - 1)
+    lod = uv.new_zeros(uv.shape[:3])
+    if uv_da is not None:
+        lod = lod + _level_of_detail(uv_da, tex.shape[1], tex.shape[2])
+    if mip_level_bias is not None:
+        lod = lod + mip_level_bias
+    lod = lod.clamp(0, len(levels) - 1)
     if filter_mode == "linear-mipmap-nearest":
         nearest = torch.floor(lod + 0.5).detach()
         weights = [(nearest == i).to(uv.dtype) for i in range(len(levels))]

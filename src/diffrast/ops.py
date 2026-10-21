@@ -127,12 +127,13 @@ def texture(
             the texture width and ``v`` along its height; ``(0, 0)`` is the outer corner of texel
             ``[0, 0]`` and ``(1, 1)`` the outer corner of the last texel.
         uv_da: Screen-space derivatives ``(du/dx, du/dy, dv/dx, dv/dy)`` of ``uv``, shape
-            ``[batch, height, width, 4]``, as returned by :func:`interpolate`. Required for the
-            mipmapped filter modes.
-        mip_level_bias: Not supported yet; must be ``None``.
+            ``[batch, height, width, 4]``, as returned by :func:`interpolate`. The mipmapped
+            filter modes need it or ``mip_level_bias``.
+        mip_level_bias: Per-pixel offset added to the mip level of detail, shape
+            ``[batch, height, width]``. Without ``uv_da`` it sets the level directly.
         mip: Precomputed mip levels are not supported yet; must be ``None``.
-        filter_mode: ``"auto"`` picks ``"linear-mipmap-linear"`` when ``uv_da`` is given and
-            ``"linear"`` otherwise.
+        filter_mode: ``"auto"`` picks ``"linear-mipmap-linear"`` when ``uv_da`` or
+            ``mip_level_bias`` is given and ``"linear"`` otherwise.
         boundary_mode: Coordinates outside ``[0, 1]`` repeat the texture (``"wrap"``), repeat its
             edge texels (``"clamp"``), or read zeros (``"zero"``).
         max_mip_level: Index of the coarsest mip level to use, or ``None`` for a full chain.
@@ -141,8 +142,8 @@ def texture(
     Returns:
         Sampled values of shape ``[batch, height, width, channels]``.
     """
-    if mip_level_bias is not None or mip is not None:
-        raise NotImplementedError("mip_level_bias and mip are not supported yet.")
+    if mip is not None:
+        raise NotImplementedError("Precomputed mip levels (mip=...) are not supported yet.")
     _check(tex, "tex", ndim=4, dtype=torch.float32)
     _check(uv, "uv", ndim=4, last=2, dtype=torch.float32)
     if tex.shape[0] not in (1, uv.shape[0]):
@@ -155,20 +156,25 @@ def texture(
         raise ValueError(
             f"Unknown boundary_mode {boundary_mode!r}; expected one of {BOUNDARY_MODES}."
         )
+    has_lod = uv_da is not None or mip_level_bias is not None
     if filter_mode == "auto":
-        filter_mode = "linear-mipmap-linear" if uv_da is not None else "linear"
-    if "mipmap" in filter_mode and uv_da is None:
-        raise ValueError(f"filter_mode {filter_mode!r} requires uv_da.")
+        filter_mode = "linear-mipmap-linear" if has_lod else "linear"
+    if "mipmap" in filter_mode and not has_lod:
+        raise ValueError(f"filter_mode {filter_mode!r} requires uv_da or mip_level_bias.")
     if uv_da is not None:
         _check(uv_da, "uv_da", ndim=4, last=4, dtype=torch.float32)
         if uv_da.shape[:3] != uv.shape[:3]:
             raise ValueError("uv_da must match uv in batch, height and width.")
+    if mip_level_bias is not None:
+        _check(mip_level_bias, "mip_level_bias", ndim=3, dtype=torch.float32)
+        if mip_level_bias.shape != uv.shape[:3]:
+            raise ValueError("mip_level_bias must match uv in batch, height and width.")
     if max_mip_level is not None and max_mip_level < 0:
         raise ValueError(f"max_mip_level must be non-negative, got {max_mip_level}.")
 
-    _check_devices(tex=tex, uv=uv, uv_da=uv_da)
+    _check_devices(tex=tex, uv=uv, uv_da=uv_da, mip_level_bias=mip_level_bias)
     return get_backend(uv.device, "texture").texture(
-        tex, uv, uv_da, filter_mode, boundary_mode, max_mip_level
+        tex, uv, uv_da, filter_mode, boundary_mode, max_mip_level, mip_level_bias=mip_level_bias
     )
 
 

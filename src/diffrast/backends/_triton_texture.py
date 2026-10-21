@@ -71,12 +71,17 @@ def _level_of_detail(da_ptr, p, valid, height, width):
 
 
 @triton.jit
-def _levels(da_ptr, offs_ptr, hs_ptr, ws_ptr, p, valid, num_levels, MODE: tl.constexpr):
+def _levels(da_ptr, bias_ptr, offs_ptr, hs_ptr, ws_ptr, p, valid, num_levels,
+            MODE: tl.constexpr, HAS_DA: tl.constexpr, HAS_BIAS: tl.constexpr):  # fmt: skip
     """Per pixel: the two levels to blend, the blend factor, and the unclamped level of detail."""
     base_h = tl.load(hs_ptr)
     base_w = tl.load(ws_ptr)
     if MODE >= 2:
-        lod_raw = _level_of_detail(da_ptr, p, valid, base_h, base_w)[0]
+        lod_raw = tl.zeros(p.shape, dtype=tl.float32)
+        if HAS_DA:
+            lod_raw += _level_of_detail(da_ptr, p, valid, base_h, base_w)[0]
+        if HAS_BIAS:
+            lod_raw += tl.load(bias_ptr + p, mask=valid, other=0.0)
         lod = tl.minimum(tl.maximum(lod_raw, 0.0), (num_levels - 1) * 1.0)
         if MODE == 2:
             lower = tl.math.floor(lod + 0.5)
@@ -102,6 +107,7 @@ def _forward_kernel(
     ws_ptr,
     uv_ptr,
     da_ptr,
+    bias_ptr,
     out_ptr,
     num_pixels,
     pixels_per_image,
@@ -110,6 +116,8 @@ def _forward_kernel(
     num_levels,
     MODE: tl.constexpr,
     BOUNDARY: tl.constexpr,
+    HAS_DA: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK_P: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -118,7 +126,8 @@ def _forward_kernel(
     u = tl.load(uv_ptr + p * 2, mask=valid, other=0.0)
     v = tl.load(uv_ptr + p * 2 + 1, mask=valid, other=0.0)
     image = (p // pixels_per_image) * tex_batch_stride
-    lo, hi, frac, _ = _levels(da_ptr, offs_ptr, hs_ptr, ws_ptr, p, valid, num_levels, MODE)
+    lo, hi, frac, _ = _levels(da_ptr, bias_ptr, offs_ptr, hs_ptr, ws_ptr, p, valid, num_levels,
+                              MODE, HAS_DA, HAS_BIAS)  # fmt: skip
 
     h_lo, w_lo = tl.load(hs_ptr + lo), tl.load(ws_ptr + lo)
     base_lo = image + tl.load(offs_ptr + lo)
@@ -217,10 +226,12 @@ def _backward_kernel(
     ws_ptr,
     uv_ptr,
     da_ptr,
+    bias_ptr,
     grad_out_ptr,
     grad_flat_ptr,
     grad_uv_ptr,
     grad_da_ptr,
+    grad_bias_ptr,
     num_pixels,
     pixels_per_image,
     tex_batch_stride,
@@ -228,6 +239,8 @@ def _backward_kernel(
     num_levels,
     MODE: tl.constexpr,
     BOUNDARY: tl.constexpr,
+    HAS_DA: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     BLOCK_P: tl.constexpr,
     BLOCK_C: tl.constexpr,
     ROUNDS: tl.constexpr,
@@ -237,7 +250,8 @@ def _backward_kernel(
     u = tl.load(uv_ptr + p * 2, mask=valid, other=0.0)
     v = tl.load(uv_ptr + p * 2 + 1, mask=valid, other=0.0)
     image = (p // pixels_per_image) * tex_batch_stride
-    lo, hi, frac, lod_raw = _levels(da_ptr, offs_ptr, hs_ptr, ws_ptr, p, valid, num_levels, MODE)
+    lo, hi, frac, lod_raw = _levels(da_ptr, bias_ptr, offs_ptr, hs_ptr, ws_ptr, p, valid,
+                                    num_levels, MODE, HAS_DA, HAS_BIAS)  # fmt: skip
 
     h_lo, w_lo = tl.load(hs_ptr + lo), tl.load(ws_ptr + lo)
     base_lo = image + tl.load(offs_ptr + lo)
@@ -296,15 +310,21 @@ def _backward_kernel(
     tl.store(grad_uv_ptr + p * 2 + 1, grad_v, mask=valid)
 
     if MODE == 3:
+        # The level of detail is clamped to the available levels.
+        in_range = (lod_raw >= 0) & (lod_raw <= (num_levels - 1) * 1.0)
+        grad_lod = tl.where(in_range, grad_frac, 0.0)
+        if HAS_BIAS:
+            tl.store(grad_bias_ptr + p, grad_lod, mask=valid)
+    if (MODE == 3) and HAS_DA:
         base_h = tl.load(hs_ptr)
         base_w = tl.load(ws_ptr)
         _, len_x, len_y, longest, du_dx, du_dy, dv_dx, dv_dy, w2, h2 = _level_of_detail(
             da_ptr, p, valid, base_h, base_w
         )
-        # The level of detail is clamped to the available levels, and the footprint from below.
-        in_range = (lod_raw >= 0) & (lod_raw <= (num_levels - 1) * 1.0)
-        in_range = in_range & (longest > 1e-30)
-        grad_longest = tl.where(in_range, grad_frac * 0.5 / (longest * 0.6931471805599453), 0.0)
+        # lod = log2(longest) / 2, with the footprint clamped from below.
+        grad_longest = tl.where(
+            longest > 1e-30, grad_lod * 0.5 / (longest * 0.6931471805599453), 0.0
+        )
         share_x = tl.where(len_x > len_y, 1.0, tl.where(len_x == len_y, 0.5, 0.0))
         grad_x = grad_longest * share_x
         grad_y = grad_longest * (1 - share_x)
@@ -316,43 +336,52 @@ def _backward_kernel(
 
 class Texture(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, flat, uv, uv_da, offsets, heights, widths, mode, boundary):
+    def forward(ctx, flat, uv, uv_da, bias, offsets, heights, widths, mode, boundary):
         batch, height, width, _ = uv.shape
         channels = flat.shape[-1]
         uv = uv.contiguous()
-        da = uv_da.contiguous() if mode >= 2 else uv
+        # Unused pointer arguments get a placeholder; the code reading them is compiled out.
+        has_da = mode >= 2 and uv_da is not None
+        has_bias = mode >= 2 and bias is not None
+        da = uv_da.contiguous() if has_da else uv
+        bias = bias.contiguous() if has_bias else uv
         out = uv.new_empty(batch, height, width, channels)
         args = _launch_args(flat, uv, offsets)
         with torch.cuda.device(uv.device):
             _forward_kernel[args["grid"]](
-                flat, offsets, heights, widths, uv, da, out,
+                flat, offsets, heights, widths, uv, da, bias, out,
                 args["num_pixels"], args["pixels_per_image"], args["batch_stride"],
                 channels, offsets.shape[0],
-                MODE=mode, BOUNDARY=boundary, BLOCK_P=BLOCK_PIXELS, BLOCK_C=args["block_c"],
+                MODE=mode, BOUNDARY=boundary, HAS_DA=has_da, HAS_BIAS=has_bias,
+                BLOCK_P=BLOCK_PIXELS, BLOCK_C=args["block_c"],
             )  # fmt: skip
-        ctx.save_for_backward(flat, uv, da, offsets, heights, widths)
+        ctx.save_for_backward(flat, uv, da, bias, offsets, heights, widths)
         ctx.mode, ctx.boundary = mode, boundary
+        ctx.has_da, ctx.has_bias = has_da, has_bias
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        flat, uv, da, offsets, heights, widths = ctx.saved_tensors
+        flat, uv, da, bias, offsets, heights, widths = ctx.saved_tensors
         grad_out = grad_out.contiguous()
         grad_flat = torch.zeros_like(flat)
         grad_uv = torch.empty_like(uv)
-        grad_da = torch.zeros_like(da) if ctx.mode == 3 else grad_uv
+        # Only trilinear filtering depends smoothly on the level of detail.
+        smooth = ctx.mode == 3
+        grad_da = torch.zeros_like(da) if smooth and ctx.has_da else grad_uv
+        grad_bias = torch.zeros_like(bias) if smooth and ctx.has_bias else grad_uv
         args = _launch_args(flat, uv, offsets)
         with torch.cuda.device(uv.device):
             _backward_kernel[args["grid"]](
-                flat, offsets, heights, widths, uv, da, grad_out, grad_flat, grad_uv, grad_da,
-                args["num_pixels"], args["pixels_per_image"], args["batch_stride"],
-                flat.shape[-1], offsets.shape[0],
-                MODE=ctx.mode, BOUNDARY=ctx.boundary, BLOCK_P=BLOCK_PIXELS,
-                BLOCK_C=args["block_c"], ROUNDS=SCATTER_ROUNDS,
+                flat, offsets, heights, widths, uv, da, bias, grad_out, grad_flat, grad_uv,
+                grad_da, grad_bias, args["num_pixels"], args["pixels_per_image"],
+                args["batch_stride"], flat.shape[-1], offsets.shape[0],
+                MODE=ctx.mode, BOUNDARY=ctx.boundary, HAS_DA=ctx.has_da, HAS_BIAS=ctx.has_bias,
+                BLOCK_P=BLOCK_PIXELS, BLOCK_C=args["block_c"], ROUNDS=SCATTER_ROUNDS,
             )  # fmt: skip
-        # Only trilinear filtering depends smoothly on uv_da.
-        grad_uv_da = grad_da if ctx.mode == 3 else None
-        return grad_flat, grad_uv, grad_uv_da, None, None, None, None, None
+        grad_uv_da = grad_da if smooth and ctx.has_da else None
+        grad_mip_bias = grad_bias if smooth and ctx.has_bias else None
+        return grad_flat, grad_uv, grad_uv_da, grad_mip_bias, None, None, None, None, None
 
 
 def texture(
@@ -362,6 +391,7 @@ def texture(
     filter_mode: str,
     boundary_mode: str,
     max_mip_level: int | None,
+    mip_level_bias: Tensor | None = None,
 ) -> Tensor:
     mode = FILTER_MODES.index(filter_mode)
     levels = _mip_chain(tex, max_mip_level) if mode >= 2 else [tex]
@@ -375,6 +405,7 @@ def texture(
         flat.contiguous(),
         uv,
         uv_da,
+        mip_level_bias,
         offsets.to(device),
         sizes[:, 0].contiguous().to(device),
         sizes[:, 1].contiguous().to(device),
