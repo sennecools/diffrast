@@ -27,6 +27,8 @@ All notable changes to this project are documented here. The format is based on
 - Triton `antialias`, forward and backward, with position gradients chained analytically through
   the edge functions.
 - Benchmarks for each op in `benchmarks/`.
+- `examples/texture_fitting.py`, which recovers a texture from renders of a sphere and can write the
+  progress as a GIF.
 
 ### Changed
 

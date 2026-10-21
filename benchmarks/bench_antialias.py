@@ -8,9 +8,9 @@ from __future__ import annotations
 import argparse
 
 import torch
-from bench_rasterize import grid_mesh, time_ms
 
 import diffrast as dr
+from bench_rasterize import grid_mesh, time_ms
 
 
 def measure(ctx, pos, tri, res, repeats, warmup_s) -> tuple[float, float]:

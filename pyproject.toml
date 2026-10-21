@@ -43,17 +43,18 @@ Changelog = "https://github.com/sennecools/diffrast/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6", "pre-commit>=3.5"]
+examples = ["numpy>=1.24", "pillow>=10.1"]
 
 [tool.hatch.version]
 path = "src/diffrast/__init__.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "docs", "CHANGELOG.md"]
+include = ["src", "tests", "docs", "examples", "benchmarks", "CHANGELOG.md"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-src = ["src", "tests"]
+src = ["src", "tests", "examples", "benchmarks"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]

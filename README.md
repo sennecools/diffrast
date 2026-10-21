@@ -10,6 +10,13 @@ under the **MIT license**, with an API that mirrors [nvdiffrast](https://github.
 > **Status: early development.** All four ops work and run on Triton (AMD and NVIDIA), with a
 > pure-PyTorch reference backend as fallback. See the [roadmap](#roadmap).
 
+![Fitting a texture to renders of a sphere](docs/images/texture_fitting.gif)
+
+*A texture recovered from rendered images alone, on an AMD RX 9070 XT. Starting from flat grey,
+it is optimized so that its renders match the targets, with gradients flowing back through
+antialiasing, mipmapped texture sampling, interpolation and rasterization. See
+[`examples/texture_fitting.py`](examples/texture_fitting.py).*
+
 ## Why
 
 Most image-to-3D, texturing and inverse-rendering pipelines render a mesh from several views and
@@ -103,9 +110,19 @@ RX 9070 XT.
 - [x] Triton backend: `interpolate`
 - [x] Triton backend: `texture`
 - [x] Triton backend: `antialias`
-- [ ] Texture-fitting example
+- [x] Texture-fitting example
 - [ ] Benchmarks on AMD and NVIDIA
 - [ ] PyPI release
+
+## Examples
+
+```bash
+pip install -e . --group examples
+python examples/texture_fitting.py --gif texture_fitting.gif
+```
+
+`texture_fitting.py` renders a textured sphere from random views and recovers the texture from
+those images. It runs on any supported GPU in a few seconds, and on the CPU with `--device cpu`.
 
 ## Development
 
