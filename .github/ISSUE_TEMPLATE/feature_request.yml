@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest a new op, option, or platform to support.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use case
+      description: What are you trying to do, and which pipeline or project needs it?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The API or behaviour you would like. Link public documentation if it mirrors an existing library.
