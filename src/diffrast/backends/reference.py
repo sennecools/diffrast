@@ -154,7 +154,54 @@ def texture(
 def antialias(
     color: Tensor, rast: Tensor, pos: Tensor, tri: Tensor, pos_gradient_boost: float
 ) -> Tensor:
-    raise NotImplementedError("antialias is not implemented in the reference backend yet.")
+    """Blend colours across silhouette edges by where each edge crosses between pixel centres.
+
+    For every pair of horizontally or vertically adjacent pixels showing different triangles,
+    the silhouette edge between them is found and the point ``t`` (in ``[0, 1]``, from the first
+    pixel) where it crosses the segment joining their centres. Treating each pixel as a unit box
+    along that axis, the pixel whose half contains the crossing takes ``|t - 0.5|`` of the other
+    pixel's colour. ``t`` depends on the vertex positions, so moving an edge changes the image
+    continuously and gives gradients to ``pos``.
+    """
+    if tri.shape[0] == 0:
+        return color
+    height, width = rast.shape[1:3]
+    tri = tri.long()
+    tri_id = rast[..., 3].detach().round().long() - 1
+    depth = rast[..., 2].detach()
+    with torch.no_grad():
+        silhouette = _silhouette_edges(pos.detach(), tri)
+    px, py = pixel_centres(height, width, pos)
+
+    out = color
+    for d_row, d_col in ((0, 1), (1, 0)):
+        id_p = tri_id[:, : height - d_row, : width - d_col]
+        id_q = tri_id[:, d_row:, d_col:]
+        b, row, col = (id_p != id_q).nonzero(as_tuple=True)
+        row_q, col_q = row + d_row, col + d_col
+        horizontal = d_col == 1
+
+        args = (pos, tri, silhouette, b, horizontal, width, height)
+        from_p, t_p = _edge_crossing(
+            *args, id_p[b, row, col], px[col], py[row], px[col_q], py[row_q]
+        )
+        from_q, t_q = _edge_crossing(
+            *args, id_q[b, row, col], px[col_q], py[row_q], px[col], py[row]
+        )
+
+        # When both pixels' triangles have an edge between them, the nearer one is in front.
+        use_p = from_p & (~from_q | (depth[b, row, col] <= depth[b, row_q, col_q]))
+        use_q = from_q & ~use_p
+        t = torch.where(use_p, t_p, 1 - t_q)
+        t = t.detach() + pos_gradient_boost * (t - t.detach())
+        active = (use_p | use_q)[:, None]
+
+        c_p, c_q = color[b, row, col], color[b, row_q, col_q]
+        delta_p = torch.where(active & (t < 0.5)[:, None], (0.5 - t)[:, None] * (c_q - c_p), 0.0)
+        delta_q = torch.where(active & (t >= 0.5)[:, None], (t - 0.5)[:, None] * (c_p - c_q), 0.0)
+        out = out.index_put((b, row, col), delta_p, accumulate=True)
+        out = out.index_put((b, row_q, col_q), delta_q, accumulate=True)
+    return out
 
 
 def pixel_centres(height: int, width: int, like: Tensor) -> tuple[Tensor, Tensor]:
@@ -266,3 +313,78 @@ def _fetch(tex: Tensor, row: Tensor, col: Tensor, boundary_mode: str) -> Tensor:
     image = torch.arange(row.shape[0], device=row.device)[:, None, None] if tex_batch > 1 else 0
     texels = tex.reshape(-1, channels)[(image * height + row) * width + col]
     return texels if valid is None else texels * valid[..., None]
+
+
+def _edge_crossing(
+    pos: Tensor,
+    tri: Tensor,
+    silhouette: Tensor,
+    b: Tensor,
+    horizontal: bool,
+    width: int,
+    height: int,
+    tri_id: Tensor,
+    src_x: Tensor,
+    src_y: Tensor,
+    dst_x: Tensor,
+    dst_y: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Where the triangle visible at ``src`` is exited along the segment to ``dst``.
+
+    Returns ``(found, t)``. ``found`` is false when there is no triangle at ``src``, the triangle
+    also covers ``dst``, the edge it exits through is not a silhouette, or that edge is closer to
+    the other axis (it is handled by the pixel pairs along that axis). ``t`` is the crossing as a
+    fraction of the segment from ``src``.
+    """
+    visible = tri_id >= 0
+    tri_id = tri_id.clamp(min=0)
+    x, y, _, w = pos[b[:, None], tri[tri_id]].unbind(-1)
+
+    # The edge functions are affine in screen space, so each edge's crossing is found by
+    # linear interpolation between the two pixel centres.
+    e_src = _edge_functions(x, y, w, src_x, src_y)
+    e_dst = _edge_functions(x, y, w, dst_x, dst_y)
+    sign = torch.where(e_src.sum(-1, keepdim=True) < 0, -1.0, 1.0)
+    outside = e_dst * sign < 0
+    t_edge = torch.where(outside, e_src / torch.where(outside, e_src - e_dst, 1.0), torch.inf)
+    t, edge = t_edge.min(-1)
+
+    de_dx, de_dy = _edge_derivatives(x, y, w, src_x, src_y)
+    normal_x = de_dx.gather(-1, edge[:, None]).squeeze(-1).abs() * (2 / width)
+    normal_y = de_dy.gather(-1, edge[:, None]).squeeze(-1).abs() * (2 / height)
+    along_axis = normal_x >= normal_y if horizontal else normal_y > normal_x
+
+    found = visible & outside.any(-1) & silhouette[b, tri_id, edge] & along_axis
+    return found.detach(), torch.where(found, t, 0.0)
+
+
+def _silhouette_edges(pos: Tensor, tri: Tensor) -> Tensor:
+    """Which triangle edges are silhouettes, ``[batch, triangles, 3]``.
+
+    Edge ``k`` of a triangle is the one opposite vertex ``k``. It is a silhouette when no other
+    triangle shares it, when more than two do, or when the triangle sharing it projects onto the
+    same side of it (the surface folds over at that edge).
+    """
+    num_tri = tri.shape[0]
+    start, end = tri[:, [1, 2, 0]].flatten(), tri[:, [2, 0, 1]].flatten()
+    key = torch.minimum(start, end) * (int(tri.max()) + 1) + torch.maximum(start, end)
+    _, inverse, counts = torch.unique(key, return_inverse=True, return_counts=True)
+    order = torch.argsort(inverse, stable=True)
+    first = (counts.cumsum(0) - counts)[(counts == 2).nonzero().squeeze(1)]
+    neighbour = torch.full_like(key, -1)
+    neighbour[order[first]] = order[first + 1]
+    neighbour[order[first + 1]] = order[first]
+
+    # The side of the edge's projected line a point lies on is the sign of det[a, b, p] / w_p in
+    # homogeneous (x, y, w) coordinates; the factor 1 / (w_a * w_b) is shared and drops out.
+    xyw = pos[..., [0, 1, 3]]
+    line = torch.linalg.cross(xyw[:, start], xyw[:, end], dim=-1)
+
+    def side(vertex: Tensor) -> Tensor:
+        p = xyw[:, vertex]
+        return torch.sign((line * p).sum(-1) * p[..., 2])
+
+    opposite = tri.flatten()
+    shared = neighbour >= 0
+    fold = side(opposite) * side(opposite[neighbour.clamp(min=0)]) > 0
+    return (~shared | fold).view(-1, num_tri, 3)

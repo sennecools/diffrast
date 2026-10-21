@@ -14,6 +14,8 @@ All notable changes to this project are documented here. The format is based on
   attributes and barycentrics, and screen-space derivatives (`rast_db`, `out_da`).
 - Reference `texture` with `nearest`, `linear`, `linear-mipmap-nearest` and `linear-mipmap-linear`
   filtering and `wrap`, `clamp` and `zero` boundaries, with gradients to `tex`, `uv` and `uv_da`.
+- Reference `antialias`: blends colours across silhouette edges by where each edge crosses
+  between pixel centres, giving continuous images and gradients to vertex positions.
 - Triton `rasterize`: tile binning and a coverage kernel that merges depth with 64-bit atomics.
   Matches the reference backend pixel for pixel on the test scenes.
 - Triton `rasterize` draws triangles with a pixel bounding box of at most 4 x 4 directly, without

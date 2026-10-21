@@ -186,7 +186,9 @@ def antialias(
         color: Shaded image, float32 of shape ``[batch, height, width, channels]``.
         rast: First output of :func:`rasterize` for the same geometry.
         pos: Clip-space vertex positions used to produce ``rast``.
-        tri: Vertex indices used to produce ``rast``.
+        tri: Vertex indices used to produce ``rast``. Silhouettes are found from edges shared by
+            index, so vertices split only for UV seams or normals turn those seams into
+            silhouettes; pass position-only indices here.
         topology_hash: Accepted for API compatibility and ignored.
         pos_gradient_boost: Multiplier applied to the gradients flowing into ``pos``.
 

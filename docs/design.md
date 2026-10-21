@@ -67,6 +67,32 @@ derivatives of `b` with respect to `(px, py)`.
 - The mip chain is rebuilt on every call from `tex`, so gradients reach the base texture through
   all levels.
 
+### antialias
+
+Visibility is a step function of the vertex positions, so a plain render has no gradient that
+moves a silhouette. `antialias` replaces the step with a ramp:
+
+1. **Silhouette edges.** Edges are matched between triangles by their vertex indices. An edge is a
+   silhouette when it belongs to one triangle only, to more than two, or when the two triangles
+   sharing it project onto the same side of it (the surface folds over there). Edges inside a
+   continuous surface are left alone even if the colour changes across them.
+2. **Crossings.** For each pair of horizontally or vertically adjacent pixels showing different
+   triangles, each pixel's triangle is tested at the other pixel's centre. A triangle that does
+   not cover it is exited through one of its edges; since the homogeneous edge functions are
+   affine in screen space, the crossing point `t` along the segment between the centres follows
+   by linear interpolation. If both triangles qualify, the nearer one owns the edge. An edge is
+   only handled by the pixel pairs along the axis it crosses more steeply, so diagonal edges are
+   not blended twice.
+3. **Blending.** Each pixel is treated as a unit box along that axis. The pixel whose half contains
+   the crossing takes `|t - 0.5|` of the other pixel's colour, which is its exact covered fraction
+   for a straight edge. Summed over a row, this recovers the crossing position exactly, so the
+   total area of a straight edge is exact at any slope; only corners where two silhouettes meet
+   are approximated.
+
+The result is continuous in the vertex positions: when an edge passes a pixel centre and the
+pixel changes owner, the blended colour is the same on both sides. `pos_gradient_boost` scales
+the gradient through `t` without changing the image.
+
 ## Triton rasterize
 
 The Triton backend replaces only the visibility pass; `rast` and `rast_db` are then built by the
@@ -104,8 +130,8 @@ and on the test scenes both backends pick the same triangle for every pixel.
 - Through `rasterize`, gradients flow from `(u, v, z / w)` and `rast_db` into the vertex positions
   of the visible triangle. Which triangle is visible is a discrete choice and has no gradient.
 - `antialias` provides the missing visibility gradient: along silhouette edges it blends the
-  colours on both sides by the edge's analytic coverage of the pixel, so moving a vertex changes
-  the image smoothly.
+  colours on both sides by the edge's coverage of the pixel, so moving a vertex changes the image
+  continuously.
 - `interpolate` passes gradients to `attr`, `rast` and `rast_db`; `texture` to `tex`, `uv` and
   `uv_da`.
 
