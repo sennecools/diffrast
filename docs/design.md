@@ -125,6 +125,17 @@ Both kernels read vertices through `tri` directly from `pos`, so no per-triangle
 vertex data is made. The coverage and depth tests use the same formulas as the reference backend,
 and on the test scenes both backends pick the same triangle for every pixel.
 
+## Triton interpolate
+
+`_triton_interpolate.py` has a forward and a backward kernel joined by a `torch.autograd.Function`.
+Each program handles a block of 64 pixels and loops over the attribute channels in chunks of up
+to 16, reading the visible triangle's three vertex rows directly from `attr`. Attributes shared
+across the batch are read in place rather than expanded.
+
+The backward kernel sums the gradients of `u`, `v` and the four `rast_db` entries over channels
+in registers, so they need no atomics. Gradients to `attr` are scattered to the three vertices of
+each pixel's triangle with `atomic_add`.
+
 ## Gradients
 
 - Through `rasterize`, gradients flow from `(u, v, z / w)` and `rast_db` into the vertex positions

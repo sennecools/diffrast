@@ -21,7 +21,8 @@ All notable changes to this project are documented here. The format is based on
 - Triton `rasterize` draws triangles with a pixel bounding box of at most 4 x 4 directly, without
   tile binning. On an RX 9070 XT, a 1M-triangle mesh at 8 views and 512 x 512 goes from about
   220 ms to 6 ms forward.
-- `benchmarks/bench_rasterize.py`.
+- Triton `interpolate`, forward and backward, including attribute derivatives.
+- `benchmarks/bench_rasterize.py` and `benchmarks/bench_interpolate.py`.
 
 ### Changed
 

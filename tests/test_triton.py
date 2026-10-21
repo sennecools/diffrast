@@ -5,6 +5,8 @@ import torch
 
 pytest.importorskip("triton")
 
+import diffrast as dr
+from diffrast import backends
 from diffrast.backends import _triton_rasterize, reference
 from diffrast.backends import triton as triton_backend
 
@@ -156,3 +158,77 @@ def test_small_triangle_threshold_does_not_change_result(monkeypatch, small):
     gen = torch.Generator().manual_seed(7)
     pos, tri = mixed_mesh(gen)
     assert_matches_reference(pos, tri, (96, 80), max_mismatch=1e-3)
+
+
+class TestInterpolate:
+    def scene(self, channels, attr_layout, seed=0, dtype=torch.float32):
+        gen = torch.Generator().manual_seed(seed)
+        pos, tri = random_mesh(80, gen, batch=2)
+        rast, rast_db = reference.rasterize(pos.to(dtype), tri, (40, 56), True)
+        num_vert = pos.shape[1]
+        shape = {"shared": (num_vert, channels), "single": (1, num_vert, channels)}.get(
+            attr_layout, (2, num_vert, channels)
+        )
+        attr = torch.randn(*shape, generator=gen, dtype=dtype).cuda()
+        return attr, rast.detach(), rast_db.detach(), tri
+
+    @pytest.mark.parametrize("channels", [1, 5, 16, 33])
+    @pytest.mark.parametrize("attr_layout", ["shared", "single", "per_view"])
+    def test_forward_matches_reference(self, channels, attr_layout):
+        attr, rast, rast_db, tri = self.scene(channels, attr_layout)
+        for diff in ([], list(range(channels)), [channels - 1, 0]):
+            ref = reference.interpolate(attr, rast, tri, rast_db, diff)
+            out = triton_backend.interpolate(attr, rast, tri, rast_db, diff)
+            torch.testing.assert_close(out[0], ref[0])
+            if diff:
+                torch.testing.assert_close(out[1], ref[1])
+            else:
+                assert out[1] is None
+
+    @pytest.mark.parametrize("attr_layout", ["shared", "per_view"])
+    @pytest.mark.parametrize("diff", [[], [0, 2, 3]])
+    def test_gradients_match_reference(self, attr_layout, diff):
+        attr, rast, rast_db, tri = self.scene(20, attr_layout, seed=1)
+        gen = torch.Generator().manual_seed(2)
+        grad_out = torch.randn(*rast.shape[:3], 20, generator=gen).cuda()
+        grad_da = torch.randn(*rast.shape[:3], 2 * len(diff), generator=gen).cuda()
+
+        grads = []
+        for backend in (reference, triton_backend):
+            inputs = [t.clone().requires_grad_(True) for t in (attr, rast, rast_db)]
+            out, out_da = backend.interpolate(inputs[0], inputs[1], tri, inputs[2], diff)
+            loss = (out * grad_out).sum() + ((out_da * grad_da).sum() if diff else 0)
+            loss.backward()
+            grads.append([t.grad if t.grad is not None else torch.zeros_like(t) for t in inputs])
+        for ours, ref in zip(grads[1], grads[0], strict=True):
+            torch.testing.assert_close(ours, ref, atol=1e-4, rtol=1e-4)
+
+    def test_gradient_through_derivatives_only(self):
+        attr, rast, rast_db, tri = self.scene(4, "shared", seed=3)
+        grads = []
+        for backend in (reference, triton_backend):
+            a = attr.clone().requires_grad_(True)
+            _, out_da = backend.interpolate(a, rast, tri, rast_db, [1, 2])
+            out_da.sum().backward()
+            grads.append(a.grad)
+        torch.testing.assert_close(grads[1], grads[0], atol=1e-4, rtol=1e-4)
+
+    def test_gradcheck_float64(self):
+        attr, rast, rast_db, tri = self.scene(3, "per_view", seed=4, dtype=torch.float64)
+        rast, rast_db = rast[:, :8, :8].contiguous(), rast_db[:, :8, :8].contiguous()
+        inputs = [t.clone().requires_grad_(True) for t in (attr, rast, rast_db)]
+        assert torch.autograd.gradcheck(
+            lambda a, r, d: triton_backend.interpolate(a, r, tri, d, [0, 2]), inputs
+        )
+
+    def test_auto_backend_uses_triton(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            triton_backend,
+            "interpolate",
+            lambda *args: calls.append(1) or reference.interpolate(*args),
+        )
+        monkeypatch.setattr(backends, "_selected", "auto")
+        attr, rast, rast_db, tri = self.scene(3, "shared")
+        dr.interpolate(attr, rast, tri, rast_db=rast_db, diff_attrs="all")
+        assert calls

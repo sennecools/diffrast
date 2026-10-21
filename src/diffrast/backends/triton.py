@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import torch
 from torch import Tensor
 
 # Ops with a Triton kernel. "auto" backend selection routes the others to the reference backend.
-IMPLEMENTED: frozenset[str] = frozenset({"rasterize"})
+IMPLEMENTED: frozenset[str] = frozenset({"rasterize", "interpolate"})
 
 
 def rasterize(
@@ -26,7 +27,11 @@ def rasterize(
 def interpolate(
     attr: Tensor, rast: Tensor, tri: Tensor, rast_db: Tensor | None, diff_attrs: Sequence[int]
 ) -> tuple[Tensor, Tensor | None]:
-    raise NotImplementedError("interpolate is not implemented in the triton backend yet.")
+    from diffrast.backends._triton_interpolate import Interpolate
+
+    diff = torch.tensor(list(diff_attrs), dtype=torch.int32, device=rast.device)
+    out, out_da = Interpolate.apply(attr, rast, rast_db, tri, diff)
+    return out, (out_da if diff_attrs else None)
 
 
 def texture(
