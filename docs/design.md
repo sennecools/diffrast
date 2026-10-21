@@ -51,6 +51,22 @@ barycentrics of the winning triangle are then recomputed per pixel with autograd
 gradients reach exactly the vertices of the visible triangle. `rast_db` uses the analytic
 derivatives of `b` with respect to `(px, py)`.
 
+### texture
+
+- Texel `[row, col]` of a `[height, width]` texture is centred at
+  `uv = ((col + 0.5) / width, (row + 0.5) / height)`. `nearest` reads the texel containing `uv`;
+  `linear` blends the four texels around it.
+- Out-of-range texels are wrapped (`wrap`), clamped to the edge (`clamp`), or read as zero
+  (`zero`); the boundary mode applies per texel, so `zero` fades out over half a texel.
+- Mip level `i + 1` is a 2 x 2 box filter of level `i`, with each size halved and rounded up until
+  both are 1. An odd edge is averaged over the texels it covers.
+- The level of detail is `log2` of the longer screen-space footprint axis measured in base-level
+  texels, `max(|d(u, v)/dx|, |d(u, v)/dy|)`, clamped to the available levels.
+  `linear-mipmap-nearest` rounds it to the nearest level; `linear-mipmap-linear` blends the two
+  neighbouring levels, so gradients also flow into `uv_da`.
+- The mip chain is rebuilt on every call from `tex`, so gradients reach the base texture through
+  all levels.
+
 ## Triton rasterize
 
 The Triton backend replaces only the visibility pass; `rast` and `rast_db` are then built by the

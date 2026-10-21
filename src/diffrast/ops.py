@@ -123,15 +123,20 @@ def texture(
     Args:
         tex: Texture, float32 of shape ``[batch, tex_height, tex_width, channels]``. A batch of
             one is shared across all views.
-        uv: Texture coordinates in ``[0, 1]``, float32 of shape ``[batch, height, width, 2]``.
-        uv_da: Screen-space derivatives of ``uv``, shape ``[batch, height, width, 4]``. Required
-            for the mipmapped filter modes.
+        uv: Texture coordinates, float32 of shape ``[batch, height, width, 2]``. ``u`` runs along
+            the texture width and ``v`` along its height; ``(0, 0)`` is the outer corner of texel
+            ``[0, 0]`` and ``(1, 1)`` the outer corner of the last texel.
+        uv_da: Screen-space derivatives ``(du/dx, du/dy, dv/dx, dv/dy)`` of ``uv``, shape
+            ``[batch, height, width, 4]``, as returned by :func:`interpolate`. Required for the
+            mipmapped filter modes.
         mip_level_bias: Not supported yet; must be ``None``.
         mip: Precomputed mip levels are not supported yet; must be ``None``.
         filter_mode: ``"auto"`` picks ``"linear-mipmap-linear"`` when ``uv_da`` is given and
             ``"linear"`` otherwise.
-        boundary_mode: How coordinates outside ``[0, 1]`` are handled.
-        max_mip_level: Limit on the number of mip levels, or ``None`` for a full chain.
+        boundary_mode: Coordinates outside ``[0, 1]`` repeat the texture (``"wrap"``), repeat its
+            edge texels (``"clamp"``), or read zeros (``"zero"``).
+        max_mip_level: Index of the coarsest mip level to use, or ``None`` for a full chain.
+            ``0`` disables mipmapping.
 
     Returns:
         Sampled values of shape ``[batch, height, width, channels]``.

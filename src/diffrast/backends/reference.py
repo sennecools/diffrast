@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 # Upper bound on batch * triangles * pixels evaluated at once during visibility.
@@ -121,7 +122,33 @@ def texture(
     boundary_mode: str,
     max_mip_level: int | None,
 ) -> Tensor:
-    raise NotImplementedError("texture is not implemented in the reference backend yet.")
+    if filter_mode == "nearest":
+        return _sample_nearest(tex, uv, boundary_mode)
+    if filter_mode == "linear":
+        return _sample_linear(tex, uv, boundary_mode)
+
+    levels = _mip_chain(tex, max_mip_level)
+    lod = _level_of_detail(uv_da, tex.shape[1], tex.shape[2]).clamp(0, len(levels) - 1)
+    if filter_mode == "linear-mipmap-nearest":
+        nearest = torch.floor(lod + 0.5).detach()
+        weights = [(nearest == i).to(uv.dtype) for i in range(len(levels))]
+        used = [nearest == i for i in range(len(levels))]
+    else:
+        lower = lod.floor().detach()
+        frac = lod - lower
+        weights = [
+            torch.where(lower == i, 1 - frac, 0) + torch.where(lower + 1 == i, frac, 0)
+            for i in range(len(levels))
+        ]
+        used = [(lower == i) | (lower + 1 == i) for i in range(len(levels))]
+
+    out = uv.new_zeros(*uv.shape[:3], tex.shape[-1])
+    for level, weight, mask in zip(levels, weights, used, strict=True):
+        # Levels no pixel touches are skipped. A touched level is sampled even where its weight
+        # is zero, so the blend factor still receives a gradient.
+        if mask.any():
+            out = out + weight[..., None] * _sample_linear(level, uv, boundary_mode)
+    return out
 
 
 def antialias(
@@ -178,3 +205,64 @@ def _visible_triangles(pos: Tensor, tri: Tensor, px: Tensor, py: Tensor) -> Tens
         best_depth = torch.where(closer, chunk_depth, best_depth)
         best_id = torch.where(closer, chunk_id + start, best_id)
     return best_id
+
+
+def _mip_chain(tex: Tensor, max_mip_level: int | None) -> list[Tensor]:
+    """Box-filtered mip levels, halving each dimension (rounding up) until both are 1."""
+    levels = [tex]
+    while max(levels[-1].shape[1:3]) > 1 and (
+        max_mip_level is None or len(levels) <= max_mip_level
+    ):
+        height, width = levels[-1].shape[1:3]
+        kernel = (2 if height > 1 else 1, 2 if width > 1 else 1)
+        # With ceil_mode, a window hanging over an odd edge averages only the texels it covers.
+        level = F.avg_pool2d(levels[-1].permute(0, 3, 1, 2), kernel, ceil_mode=True)
+        levels.append(level.permute(0, 2, 3, 1))
+    return levels
+
+
+def _level_of_detail(uv_da: Tensor, height: int, width: int) -> Tensor:
+    """Mip level from the longer of the two screen-space footprint axes, in texels."""
+    du_dx, du_dy, dv_dx, dv_dy = uv_da.unbind(-1)
+    len_x = (du_dx * width) ** 2 + (dv_dx * height) ** 2
+    len_y = (du_dy * width) ** 2 + (dv_dy * height) ** 2
+    return 0.5 * torch.log2(torch.maximum(len_x, len_y).clamp_min(1e-30))
+
+
+def _sample_nearest(tex: Tensor, uv: Tensor, boundary_mode: str) -> Tensor:
+    height, width = tex.shape[1:3]
+    col = (uv[..., 0] * width).floor().long()
+    row = (uv[..., 1] * height).floor().long()
+    return _fetch(tex, row, col, boundary_mode)
+
+
+def _sample_linear(tex: Tensor, uv: Tensor, boundary_mode: str) -> Tensor:
+    height, width = tex.shape[1:3]
+    x = uv[..., 0] * width - 0.5
+    y = uv[..., 1] * height - 0.5
+    x0, y0 = x.floor().detach(), y.floor().detach()
+    fx, fy = (x - x0)[..., None], (y - y0)[..., None]
+    col, row = x0.long(), y0.long()
+    top = (1 - fx) * _fetch(tex, row, col, boundary_mode) + fx * _fetch(
+        tex, row, col + 1, boundary_mode
+    )
+    bottom = (1 - fx) * _fetch(tex, row + 1, col, boundary_mode) + fx * _fetch(
+        tex, row + 1, col + 1, boundary_mode
+    )
+    return (1 - fy) * top + fy * bottom
+
+
+def _fetch(tex: Tensor, row: Tensor, col: Tensor, boundary_mode: str) -> Tensor:
+    """Texels at integer coordinates ``[batch, height, width]``, with out-of-range handling."""
+    tex_batch, height, width, channels = tex.shape
+    valid = None
+    if boundary_mode == "wrap":
+        row, col = row % height, col % width
+    else:
+        if boundary_mode == "zero":
+            valid = (row >= 0) & (row < height) & (col >= 0) & (col < width)
+        row, col = row.clamp(0, height - 1), col.clamp(0, width - 1)
+
+    image = torch.arange(row.shape[0], device=row.device)[:, None, None] if tex_batch > 1 else 0
+    texels = tex.reshape(-1, channels)[(image * height + row) * width + col]
+    return texels if valid is None else texels * valid[..., None]
