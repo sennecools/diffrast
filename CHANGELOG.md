@@ -24,8 +24,9 @@ All notable changes to this project are documented here. The format is based on
 - Triton `interpolate`, forward and backward, including attribute derivatives.
 - Triton `texture` for all filter and boundary modes, forward and backward. Texel gradients are
   pre-reduced in registers where pixels share texels before they are written with atomics.
-- `benchmarks/bench_rasterize.py`, `benchmarks/bench_interpolate.py` and
-  `benchmarks/bench_texture.py`.
+- Triton `antialias`, forward and backward, with position gradients chained analytically through
+  the edge functions.
+- Benchmarks for each op in `benchmarks/`.
 
 ### Changed
 

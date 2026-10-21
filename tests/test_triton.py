@@ -337,3 +337,96 @@ class TestTexture:
         tex, uv, uv_da = self.scene()
         dr.texture(tex, uv, uv_da)
         assert calls
+
+
+class TestAntialias:
+    def scene(self, seed=0, channels=3, batch=2, **mesh):
+        pos, tri = random_mesh(60, torch.Generator().manual_seed(seed), batch=batch, **mesh)
+        rast, _ = reference.rasterize(pos, tri, (48, 64), True)
+        gen = torch.Generator().manual_seed(seed + 1)
+        color = torch.rand(batch, 48, 64, channels, generator=gen).cuda()
+        weights = torch.randn(batch, 48, 64, channels, generator=gen).cuda()
+        return pos, tri, rast, color, weights
+
+    def run(self, backend, pos, tri, rast, color, weights, boost=1.0):
+        c = color.clone().requires_grad_(True)
+        p = pos.clone().requires_grad_(True)
+        out = backend.antialias(c, rast, p, tri, boost)
+        (out * weights).sum().backward()
+        return out.detach(), c.grad, p.grad
+
+    @pytest.mark.parametrize("channels", [1, 3, 20])
+    @pytest.mark.parametrize(
+        "mesh", [{}, {"w_range": (-1.0, 2.0)}, {"z_range": 2.0, "xy_range": 3.0}]
+    )
+    def test_matches_reference(self, channels, mesh):
+        # Vertices near the camera plane get very large position gradients, where float32
+        # rounding differs between implementations. In float64 the two must agree closely.
+        args = self.scene(channels=channels, **mesh)
+        args64 = [t.double() if t.is_floating_point() else t for t in args]
+        ref = self.run(reference, *args64)
+        out = self.run(triton_backend, *args64)
+        assert (ref[0] != args64[3]).any(), "the scene should have silhouettes to blend"
+        for ours, theirs in zip(out, ref, strict=True):
+            torch.testing.assert_close(ours, theirs, atol=1e-9, rtol=1e-9)
+
+        out32 = self.run(triton_backend, *args)
+        torch.testing.assert_close(out32[0].double(), ref[0], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out32[1].double(), ref[1], atol=1e-5, rtol=1e-5)
+        scale = ref[2].abs().clamp_min(1)
+        assert ((out32[2].double() - ref[2]).abs() / scale).max() < 1e-3
+
+    def test_pos_gradient_boost(self):
+        args = self.scene(seed=3)
+        ref = self.run(reference, *args, boost=2.5)
+        out = self.run(triton_backend, *args, boost=2.5)
+        torch.testing.assert_close(out[0], ref[0], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(out[2], ref[2], atol=1e-3, rtol=1e-4)
+
+    def test_finite_differences(self, perspective_triangle):
+        pos, tri = (t.double().cuda() for t in perspective_triangle)
+        weights = torch.rand(1, 16, 16, 3, generator=torch.Generator().manual_seed(4)).double()
+        weights = weights.cuda()
+
+        def loss(p):
+            rast, _ = reference.rasterize(p, tri, (16, 16), True)
+            color = (rast[..., 3:] > 0).double().expand(-1, -1, -1, 3).contiguous()
+            return (triton_backend.antialias(color, rast, p, tri, 1.0) * weights).sum()
+
+        p = pos.clone().requires_grad_(True)
+        loss(p).backward()
+        eps = 1e-6
+        for vertex in range(3):
+            for axis in (0, 1, 3):
+                step = torch.zeros_like(pos)
+                step[0, vertex, axis] = eps
+                numeric = (loss(pos + step) - loss(pos - step)) / (2 * eps)
+                torch.testing.assert_close(p.grad[0, vertex, axis], numeric, rtol=1e-4, atol=1e-6)
+
+    def test_straight_edge_coverage_is_exact(self):
+        ctx = dr.RasterizeContext("cuda")
+        edge = 0.3
+        pos = torch.tensor(
+            [
+                [
+                    [-2.0, -2.0, 0.0, 1.0],
+                    [edge, -2.0, 0.0, 1.0],
+                    [edge, 2.0, 0.0, 1.0],
+                    [-2.0, 2.0, 0.0, 1.0],
+                ]
+            ]
+        ).cuda()
+        tri = torch.tensor([[0, 1, 2], [0, 2, 3]], dtype=torch.int32).cuda()
+        rast, _ = dr.rasterize(ctx, pos, tri, (16, 24))
+        out = triton_backend.antialias((rast[..., 3:] > 0).float(), rast, pos, tri, 1.0)
+        torch.testing.assert_close(out.sum().cpu(), torch.tensor(16 * (edge + 1) * 24 / 2))
+
+    def test_auto_backend_uses_triton(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            triton_backend, "antialias", lambda *args: calls.append(1) or reference.antialias(*args)
+        )
+        monkeypatch.setattr(backends, "_selected", "auto")
+        pos, tri, rast, color, _ = self.scene()
+        dr.antialias(color, rast, pos, tri)
+        assert calls

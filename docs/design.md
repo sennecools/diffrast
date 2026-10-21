@@ -152,6 +152,21 @@ cover many pixels per texel. So before scattering, each program sums the gradien
 that share the lowest remaining texel address, for two rounds, and writes each group with one
 atomic. Zero gradients, such as from masked-out background, are not written.
 
+## Triton antialias
+
+`_triton_antialias.py` classifies silhouette edges with the reference code (it is per triangle and
+cheap), then runs one lane per pixel, handling the pairs the pixel forms with its right and lower
+neighbours with the same crossing, ownership and blending rules as the reference backend. A
+pixel is touched by at most four pairs, so blended colours and colour gradients are added with
+atomics without meaningful contention.
+
+The backward kernel chains the gradient of the crossing point `t = e_s / (e_s - e_d)` into the two
+vertices of the crossed edge analytically. With `e = a_i c_j - a_j c_i`, `a = x - px w` and
+`c = y - py w` evaluated at both pixel centres, the partial derivatives with respect to each
+vertex's `x`, `y` and `w` are short closed forms; `z` does not affect `t`. In float64 the Triton
+and reference gradients agree to about `1e-11`; in float32 they differ only by rounding, which is
+largest for vertices close to the camera plane, whose gradients are very large.
+
 ## Gradients
 
 - Through `rasterize`, gradients flow from `(u, v, z / w)` and `rast_db` into the vertex positions
