@@ -10,3 +10,5 @@ All notable changes to this project are documented here. The format is based on
 
 - Public API for `rasterize`, `interpolate`, `texture` and `antialias`, with input validation.
 - Backend selection between `triton` and `reference`.
+- Reference implementations of `rasterize` and `interpolate`, with gradients to positions,
+  attributes and barycentrics, and screen-space derivatives (`rast_db`, `out_da`).

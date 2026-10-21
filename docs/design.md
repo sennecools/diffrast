@@ -25,8 +25,29 @@ and can assume shapes, dtypes and devices are correct. Inputs shared across the 
 - Pixel `(row, col)` covers `[col, col + 1) x [row, row + 1)` in screen space and is sampled at its
   centre. Row 0 is at clip-space `y = -1`.
 - `rast[..., 3]` stores `triangle_id + 1`, so zero means background.
-- A pixel centre exactly on a shared edge belongs to exactly one of the two triangles (a fixed
-  fill rule), so meshes render without cracks or double coverage.
+- Edges are inclusive: a pixel centre exactly on an edge is covered, so shared edges never leave
+  cracks. When several triangles cover a pixel at the same depth, the lowest triangle id wins.
+- A pixel is drawn only where the interpolated `w` is positive and `-1 <= z / w <= 1`.
+
+## Reference backend
+
+`backends/reference.py` rasterizes in homogeneous coordinates (Olano and Greer, 1997). For a pixel
+at NDC `(px, py)`, the perspective-correct barycentrics `b` of a triangle satisfy
+
+```
+sum(b * (x - px * w)) = 0
+sum(b * (y - py * w)) = 0
+sum(b) = 1
+```
+
+so `b` is the cross product of the two vectors `x - px * w` and `y - py * w`, divided by the sum
+of its components. Because the test is done on the interpolated `w` and `z / w` per pixel,
+triangles crossing the camera plane need no clipping.
+
+Visibility is resolved without autograd, evaluating triangles in chunks to bound memory. The
+barycentrics of the winning triangle are then recomputed per pixel with autograd enabled, so
+gradients reach exactly the vertices of the visible triangle. `rast_db` uses the analytic
+derivatives of `b` with respect to `(px, py)`.
 
 ## rasterize
 

@@ -26,3 +26,14 @@ def triangle():
     )
     tri = torch.tensor([[0, 1, 2]], dtype=torch.int32)
     return pos, tri
+
+
+@pytest.fixture
+def perspective_triangle():
+    """A triangle with distinct w per vertex, so barycentrics are not affine in screen space."""
+    pos = torch.tensor(
+        [[[-0.8, -0.6, 0.2, 1.0], [1.2, -0.9, 0.5, 2.0], [0.1, 1.5, -0.3, 1.5]]],
+        dtype=torch.float32,
+    )
+    tri = torch.tensor([[0, 1, 2]], dtype=torch.int32)
+    return pos, tri
