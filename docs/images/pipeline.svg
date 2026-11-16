@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 830 452" width="830" height="452" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-label="Time per full differentiable render by resolution and triangle count">
+<rect width="830" height="452" rx="8" fill="#121110"/>
+<text x="24.0" y="36.0" font-size="16" fill="#f0eadf" text-anchor="start" font-weight="600">Full differentiable render, 8 views per call</text>
+<text x="24.0" y="56.0" font-size="12" fill="#a09b93" text-anchor="start" font-weight="400">rasterize, interpolate, mipmapped texture, antialias. Milliseconds per call, log scale; lower is better.</text>
+<line x1="24" y1="80" x2="46" y2="80" stroke="#1c5cab" stroke-width="2" stroke-linecap="round"/><circle cx="35" cy="80" r="4" fill="#1c5cab"/>
+<text x="54.0" y="84.0" font-size="12" fill="#f0eadf" text-anchor="start" font-weight="400">10k triangles</text>
+<line x1="161.8" y1="80" x2="183.8" y2="80" stroke="#5598e7" stroke-width="2" stroke-linecap="round"/><circle cx="172.8" cy="80" r="4" fill="#5598e7"/>
+<text x="191.8" y="84.0" font-size="12" fill="#f0eadf" text-anchor="start" font-weight="400">100k triangles</text>
+<line x1="306.2" y1="80" x2="328.2" y2="80" stroke="#cde2fb" stroke-width="2" stroke-linecap="round"/><circle cx="317.2" cy="80" r="4" fill="#cde2fb"/>
+<text x="336.2" y="84.0" font-size="12" fill="#f0eadf" text-anchor="start" font-weight="400">1M triangles</text>
+<line x1="437.4" y1="80" x2="459.4" y2="80" stroke="#8a8580" stroke-width="2" stroke-linecap="round"/><circle cx="448.4" cy="80" r="4" fill="#8a8580"/>
+<text x="467.4" y="84.0" font-size="12" fill="#f0eadf" text-anchor="start" font-weight="400">reference backend, 10k</text>
+<text x="64.0" y="116.0" font-size="13" fill="#f0eadf" text-anchor="start" font-weight="600">forward</text>
+<line x1="64" y1="372.0" x2="372" y2="372.0" stroke="#2a2725"/>
+<text x="56.0" y="376.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">1 ms</text>
+<line x1="64" y1="312.0" x2="372" y2="312.0" stroke="#2a2725"/>
+<text x="56.0" y="316.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">10 ms</text>
+<line x1="64" y1="252.0" x2="372" y2="252.0" stroke="#2a2725"/>
+<text x="56.0" y="256.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">100 ms</text>
+<line x1="64" y1="192.0" x2="372" y2="192.0" stroke="#2a2725"/>
+<text x="56.0" y="196.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">1 s</text>
+<line x1="64" y1="132.0" x2="372" y2="132.0" stroke="#2a2725"/>
+<text x="56.0" y="136.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">10 s</text>
+<text x="72.0" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">256</text>
+<text x="161.3" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">512</text>
+<text x="250.7" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">1024</text>
+<text x="340.0" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">2048</text>
+<text x="218.0" y="412.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">resolution (pixels per side)</text>
+<polyline points="72.0,336.2 161.3,328.4 250.7,319.9 340.0,293.0" fill="none" stroke="#1c5cab" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="72.0" cy="336.2" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 256 px: 3.96 ms</title></circle>
+<circle cx="161.3" cy="328.4" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 512 px: 5.33 ms</title></circle>
+<circle cx="250.7" cy="319.9" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 1024 px: 7.39 ms</title></circle>
+<circle cx="340.0" cy="293.0" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 2048 px: 20.75 ms</title></circle>
+<polyline points="72.0,330.7 161.3,319.9 250.7,313.7 340.0,287.5" fill="none" stroke="#5598e7" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="72.0" cy="330.7" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 256 px: 4.87 ms</title></circle>
+<circle cx="161.3" cy="319.9" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 512 px: 7.39 ms</title></circle>
+<circle cx="250.7" cy="313.7" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 1024 px: 9.39 ms</title></circle>
+<circle cx="340.0" cy="287.5" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 2048 px: 25.62 ms</title></circle>
+<polyline points="72.0,287.2 161.3,287.2 250.7,285.8 340.0,274.0" fill="none" stroke="#cde2fb" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="72.0" cy="287.2" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 256 px: 25.89 ms</title></circle>
+<circle cx="161.3" cy="287.2" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 512 px: 25.86 ms</title></circle>
+<circle cx="250.7" cy="285.8" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 1024 px: 27.32 ms</title></circle>
+<circle cx="340.0" cy="274.0" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 2048 px: 43.05 ms</title></circle>
+<polyline points="72.0,168.6" fill="none" stroke="#8a8580" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="72.0" cy="168.6" r="4" fill="#8a8580" stroke="#121110" stroke-width="2"><title>reference, 10,082 triangles, 256 px: 2450.07 ms</title></circle>
+<text x="82.0" y="172.6" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">2.5 s</text>
+<text x="350.0" y="278.0" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">43 ms</text>
+<text x="350.0" y="291.5" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">26 ms</text>
+<text x="350.0" y="304.5" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">21 ms</text>
+<text x="474.0" y="116.0" font-size="13" fill="#f0eadf" text-anchor="start" font-weight="600">forward + backward</text>
+<line x1="474" y1="372.0" x2="782" y2="372.0" stroke="#2a2725"/>
+<text x="466.0" y="376.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">1 ms</text>
+<line x1="474" y1="312.0" x2="782" y2="312.0" stroke="#2a2725"/>
+<text x="466.0" y="316.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">10 ms</text>
+<line x1="474" y1="252.0" x2="782" y2="252.0" stroke="#2a2725"/>
+<text x="466.0" y="256.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">100 ms</text>
+<line x1="474" y1="192.0" x2="782" y2="192.0" stroke="#2a2725"/>
+<text x="466.0" y="196.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">1 s</text>
+<line x1="474" y1="132.0" x2="782" y2="132.0" stroke="#2a2725"/>
+<text x="466.0" y="136.0" font-size="11" fill="#a09b93" text-anchor="end" font-weight="400">10 s</text>
+<text x="482.0" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">256</text>
+<text x="571.3" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">512</text>
+<text x="660.7" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">1024</text>
+<text x="750.0" y="392.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">2048</text>
+<text x="628.0" y="412.0" font-size="11" fill="#a09b93" text-anchor="middle" font-weight="400">resolution (pixels per side)</text>
+<polyline points="482.0,321.6 571.3,305.9 660.7,276.2 750.0,243.4" fill="none" stroke="#1c5cab" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="482.0" cy="321.6" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 256 px: 6.92 ms</title></circle>
+<circle cx="571.3" cy="305.9" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 512 px: 12.64 ms</title></circle>
+<circle cx="660.7" cy="276.2" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 1024 px: 39.56 ms</title></circle>
+<circle cx="750.0" cy="243.4" r="4" fill="#1c5cab" stroke="#121110" stroke-width="2"><title>triton, 10,082 triangles, 2048 px: 139.08 ms</title></circle>
+<polyline points="482.0,316.8 571.3,304.8 660.7,276.4 750.0,243.7" fill="none" stroke="#5598e7" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="482.0" cy="316.8" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 256 px: 8.30 ms</title></circle>
+<circle cx="571.3" cy="304.8" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 512 px: 13.19 ms</title></circle>
+<circle cx="660.7" cy="276.4" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 1024 px: 39.15 ms</title></circle>
+<circle cx="750.0" cy="243.7" r="4" fill="#5598e7" stroke="#121110" stroke-width="2"><title>triton, 100,352 triangles, 2048 px: 137.71 ms</title></circle>
+<polyline points="482.0,284.5 571.3,279.6 660.7,266.2 750.0,242.4" fill="none" stroke="#cde2fb" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="482.0" cy="284.5" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 256 px: 28.77 ms</title></circle>
+<circle cx="571.3" cy="279.6" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 512 px: 34.67 ms</title></circle>
+<circle cx="660.7" cy="266.2" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 1024 px: 57.88 ms</title></circle>
+<circle cx="750.0" cy="242.4" r="4" fill="#cde2fb" stroke="#121110" stroke-width="2"><title>triton, 999,698 triangles, 2048 px: 144.38 ms</title></circle>
+<polyline points="482.0,166.7" fill="none" stroke="#8a8580" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="482.0" cy="166.7" r="4" fill="#8a8580" stroke="#121110" stroke-width="2"><title>reference, 10,082 triangles, 256 px: 2642.37 ms</title></circle>
+<text x="492.0" y="170.7" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">2.6 s</text>
+<text x="760.0" y="246.4" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">144 ms</text>
+<text x="760.0" y="259.4" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">139 ms</text>
+<text x="760.0" y="272.4" font-size="11" fill="#f0eadf" text-anchor="start" font-weight="400">138 ms</text>
+<text x="24.0" y="440.0" font-size="11" fill="#a09b93" text-anchor="start" font-weight="400">AMD Radeon RX 9070 XT · torch 2.13.0+rocm10.0.0 · triton 3.9.0</text>
+</svg>
