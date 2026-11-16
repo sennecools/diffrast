@@ -57,4 +57,4 @@ def test_no_derivatives_requested(ctx, triangle):
     pos, tri = triangle
     rast, rast_db = dr.rasterize(ctx, pos, tri, (8, 8))
     _, out_da = dr.interpolate(torch.ones(3, 2), rast, tri, rast_db=rast_db)
-    assert out_da is None
+    assert out_da.shape == (1, 8, 8, 0)

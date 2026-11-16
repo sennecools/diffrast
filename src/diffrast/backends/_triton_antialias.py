@@ -1,10 +1,19 @@
 """Triton kernels for antialias.
 
 Silhouette edges are classified with the reference backend's PyTorch code, which is per triangle
-and cheap. The kernels then run one lane per pixel, handling the pairs it forms with its right and
-lower neighbours exactly as the reference backend does. A pixel is touched by at most four pairs,
-so blended colours and gradients are added with atomics. In the backward pass, the gradient of the
-crossing point ``t`` is chained analytically into the two vertices of the crossed edge.
+and cheap once the edge adjacency of the mesh is known. The kernels then run one lane per pixel,
+handling the pairs it forms with its right and lower neighbours exactly as the reference backend
+does. A pixel is touched by at most four pairs, so blended colours and gradients are added with
+atomics. In the backward pass, the gradient of the crossing point ``t`` is chained analytically
+into the two vertices of the crossed edge.
+
+Positions shared across the batch are read in place: the kernels take the batch item modulo the
+number of items in ``pos``, which also sums the gradients of a shared ``pos`` over the batch.
+
+The kernels are compiled without floating-point fusion, so the edge functions round as in the
+reference backend and both backends pick the same edge where two candidates tie. Agreement with
+the rasterizer that produced ``rast`` does not rely on that: a pixel centre on an edge up to
+rounding is treated as on it (``reference.EDGE_TIE``).
 """
 
 from __future__ import annotations
@@ -14,7 +23,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from diffrast.backends.reference import _silhouette_edges, pixel_centres
+from diffrast.backends._autograd import first_order
+from diffrast.backends.reference import AXIS_TIE, EDGE_TIE, _silhouette_edges, pixel_centres
 
 BLOCK_PIXELS = 128
 BLOCK_CHANNELS = 16
@@ -42,8 +52,19 @@ def _edge(xi, yi, wi, xj, yj, wj, px, py):
 
 
 @triton.jit
+def _edge_slack(xi, yi, wi, xj, yj, wj, px, py):
+    """Rounding error of :func:`_edge` at ``(px, py)``, in epsilons; see the reference backend."""
+    ai, aj = tl.abs(xi - px * wi), tl.abs(xj - px * wj)
+    ci, cj = tl.abs(yi - py * wi), tl.abs(yj - py * wj)
+    reach_xi, reach_xj = tl.abs(xi) + tl.abs(wi), tl.abs(xj) + tl.abs(wj)
+    reach_yi, reach_yj = tl.abs(yi) + tl.abs(wi), tl.abs(yj) + tl.abs(wj)
+    return (reach_xi + ai) * cj + (reach_xj + aj) * ci + reach_yj * ai + reach_yi * aj
+
+
+@triton.jit
 def _crossing(pos_ptr, tri_ptr, sil_ptr, b, tri_id, src_x, src_y, dst_x, dst_y, width, height,
-              num_vert, num_tri, mask, HORIZONTAL: tl.constexpr):  # fmt: skip
+              num_vert, num_tri, mask, HORIZONTAL: tl.constexpr, AXIS: tl.constexpr,
+              EDGE: tl.constexpr):  # fmt: skip
     """Where the triangle visible at ``src`` is exited towards ``dst``: ``(found, t, edge)``.
 
     Mirrors ``reference._edge_crossing``; see there for when no crossing is reported.
@@ -61,24 +82,29 @@ def _crossing(pos_ptr, tri_ptr, sil_ptr, b, tri_id, src_x, src_y, dst_x, dst_y, 
     d1 = _edge(x2, y2, w2, x0, y0, w0, dst_x, dst_y)
     d2 = _edge(x0, y0, w0, x1, y1, w1, dst_x, dst_y)
     sign = tl.where(s0 + s1 + s2 < 0, -1.0, 1.0)
-    out0, out1, out2 = d0 * sign < 0, d1 * sign < 0, d2 * sign < 0
+    span0, span1, span2 = s0 - d0, s1 - d1, s2 - d2
+    slack0 = _edge_slack(x1, y1, w1, x2, y2, w2, dst_x, dst_y) * EDGE
+    slack1 = _edge_slack(x2, y2, w2, x0, y0, w0, dst_x, dst_y) * EDGE
+    slack2 = _edge_slack(x0, y0, w0, x1, y1, w1, dst_x, dst_y) * EDGE
+    out0 = (d0 * sign <= slack0) & (span0 * sign > 2 * slack0)
+    out1 = (d1 * sign <= slack1) & (span1 * sign > 2 * slack1)
+    out2 = (d2 * sign <= slack2) & (span2 * sign > 2 * slack2)
     inf = float("inf")
-    t0 = tl.where(out0, s0 / tl.where(out0, s0 - d0, 1.0), inf)
-    t1 = tl.where(out1, s1 / tl.where(out1, s1 - d1, 1.0), inf)
-    t2 = tl.where(out2, s2 / tl.where(out2, s2 - d2, 1.0), inf)
+    t0 = tl.where(out0, s0 / tl.where(out0, span0, 1.0), inf)
+    t1 = tl.where(out1, s1 / tl.where(out1, span1, 1.0), inf)
+    t2 = tl.where(out2, s2 / tl.where(out2, span2, 1.0), inf)
     edge = tl.where(t1 < t0, 1, 0)
     t = tl.minimum(t0, t1)
     edge = tl.where(t2 < t, 2, edge)
     t = tl.minimum(t, t2)
 
-    # Screen-space gradient of the chosen edge function, in pixel units.
+    # Slope of the chosen edge in pixel space, from its two vertices alone; see
+    # ``reference._along_axis``.
     xi, yi, wi = _pick(edge, x1, x2, x0), _pick(edge, y1, y2, y0), _pick(edge, w1, w2, w0)
     xj, yj, wj = _pick(edge, x2, x0, x1), _pick(edge, y2, y0, y1), _pick(edge, w2, w0, w1)
-    ai, aj = xi - src_x * wi, xj - src_x * wj
-    ci, cj = yi - src_y * wi, yj - src_y * wj
-    normal_x = tl.abs(wj * ci - wi * cj) * (2.0 / width)
-    normal_y = tl.abs(aj * wi - ai * wj) * (2.0 / height)
-    along_axis = normal_x >= normal_y if HORIZONTAL else normal_y > normal_x
+    steep = tl.abs(wj * yi - wi * yj) * height * AXIS
+    flat = tl.abs(xj * wi - xi * wj) * width
+    along_axis = steep >= flat if HORIZONTAL else flat > steep
 
     silhouette = tl.load(sil_ptr + (b * num_tri + tid) * 3 + edge, mask=visible, other=0) != 0
     found = visible & (out0 | out1 | out2) & silhouette & along_axis
@@ -87,7 +113,8 @@ def _crossing(pos_ptr, tri_ptr, sil_ptr, b, tri_id, src_x, src_y, dst_x, dst_y, 
 
 @triton.jit
 def _pair(pos_ptr, tri_ptr, sil_ptr, rast_ptr, px_ptr, py_ptr, p, b, row, col, valid, height,
-          width, num_vert, num_tri, HORIZONTAL: tl.constexpr):  # fmt: skip
+          width, num_vert, num_tri, HORIZONTAL: tl.constexpr, AXIS: tl.constexpr,
+          EDGE: tl.constexpr):  # fmt: skip
     """Pixel ``p`` and its right (or lower) neighbour ``q``: which triangle owns the edge between
     them, where it crosses, and how much each pixel blends."""
     if HORIZONTAL:
@@ -100,16 +127,23 @@ def _pair(pos_ptr, tri_ptr, sil_ptr, rast_ptr, px_ptr, py_ptr, p, b, row, col, v
         row_q, col_q = row + 1, col
     id_p = (tl.load(rast_ptr + p * 4 + 3, mask=pair, other=0.0) + 0.5).to(tl.int64) - 1
     id_q = (tl.load(rast_ptr + q * 4 + 3, mask=pair, other=0.0) + 0.5).to(tl.int64) - 1
+    # Ids past the end of tri are treated as background rather than read out of range.
+    id_p = tl.where(id_p < num_tri, id_p, -1)
+    id_q = tl.where(id_q < num_tri, id_q, -1)
     pair = pair & (id_p != id_q)
     x_p = tl.load(px_ptr + col, mask=pair, other=0.0)
     y_p = tl.load(py_ptr + row, mask=pair, other=0.0)
     x_q = tl.load(px_ptr + col_q, mask=pair, other=0.0)
     y_q = tl.load(py_ptr + row_q, mask=pair, other=0.0)
 
-    from_p, t_p, edge_p = _crossing(pos_ptr, tri_ptr, sil_ptr, b, id_p, x_p, y_p, x_q, y_q,
-                                    width, height, num_vert, num_tri, pair, HORIZONTAL)  # fmt: skip
-    from_q, t_q, edge_q = _crossing(pos_ptr, tri_ptr, sil_ptr, b, id_q, x_q, y_q, x_p, y_p,
-                                    width, height, num_vert, num_tri, pair, HORIZONTAL)  # fmt: skip
+    from_p, t_p, edge_p = _crossing(
+        pos_ptr, tri_ptr, sil_ptr, b, id_p, x_p, y_p, x_q, y_q, width, height, num_vert, num_tri,
+        pair, HORIZONTAL, AXIS, EDGE,
+    )  # fmt: skip
+    from_q, t_q, edge_q = _crossing(
+        pos_ptr, tri_ptr, sil_ptr, b, id_q, x_q, y_q, x_p, y_p, width, height, num_vert, num_tri,
+        pair, HORIZONTAL, AXIS, EDGE,
+    )  # fmt: skip
     depth_p = tl.load(rast_ptr + p * 4 + 2, mask=pair, other=0.0)
     depth_q = tl.load(rast_ptr + q * 4 + 2, mask=pair, other=0.0)
     use_p = from_p & (~from_q | (depth_p <= depth_q))
@@ -125,17 +159,18 @@ def _pair(pos_ptr, tri_ptr, sil_ptr, rast_ptr, px_ptr, py_ptr, p, b, row, col, v
 
 @triton.jit
 def _forward_kernel(color_ptr, rast_ptr, pos_ptr, tri_ptr, sil_ptr, px_ptr, py_ptr, out_ptr,
-                    num_pixels, height, width, num_vert, num_tri, channels,
-                    BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr):  # fmt: skip
+                    num_pixels, height, width, pos_batch, num_vert, num_tri, channels,
+                    BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr, AXIS: tl.constexpr,
+                    EDGE: tl.constexpr):  # fmt: skip
     p = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
     valid = p < num_pixels
-    b = p // (height * width)
+    b = (p // (height * width)) % pos_batch
     row = (p // width) % height
     col = p % width
     for direction in tl.static_range(2):
         q, active, _, _, blend_p, blend_q, _, _, _, _, _, _ = _pair(
             pos_ptr, tri_ptr, sil_ptr, rast_ptr, px_ptr, py_ptr, p, b, row, col, valid,
-            height, width, num_vert, num_tri, direction == 0,
+            height, width, num_vert, num_tri, direction == 0, AXIS, EDGE,
         )  # fmt: skip
         for c0 in range(0, channels, BLOCK_C):
             c = c0 + tl.arange(0, BLOCK_C)[None, :]
@@ -192,17 +227,18 @@ def _add_edge_gradient(grad_pos_ptr, pos_ptr, tri_ptr, b, tid, edge, grad_t, src
 @triton.jit
 def _backward_kernel(color_ptr, rast_ptr, pos_ptr, tri_ptr, sil_ptr, px_ptr, py_ptr,
                      grad_out_ptr, grad_color_ptr, grad_pos_ptr, boost,
-                     num_pixels, height, width, num_vert, num_tri, channels,
-                     BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr):  # fmt: skip
+                     num_pixels, height, width, pos_batch, num_vert, num_tri, channels,
+                     BLOCK_P: tl.constexpr, BLOCK_C: tl.constexpr, AXIS: tl.constexpr,
+                     EDGE: tl.constexpr):  # fmt: skip
     p = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
     valid = p < num_pixels
-    b = p // (height * width)
+    b = (p // (height * width)) % pos_batch
     row = (p // width) % height
     col = p % width
     for direction in tl.static_range(2):
         q, active, use_p, t, blend_p, blend_q, owner, edge, x_p, y_p, x_q, y_q = _pair(
             pos_ptr, tri_ptr, sil_ptr, rast_ptr, px_ptr, py_ptr, p, b, row, col, valid,
-            height, width, num_vert, num_tri, direction == 0,
+            height, width, num_vert, num_tri, direction == 0, AXIS, EDGE,
         )  # fmt: skip
         below = active & (t < 0.5)
         grad_t = tl.zeros((BLOCK_P,), dtype=t.dtype)
@@ -234,26 +270,40 @@ def _backward_kernel(color_ptr, rast_ptr, pos_ptr, tri_ptr, sil_ptr, px_ptr, py_
 
 class Antialias(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, color: Tensor, rast: Tensor, pos: Tensor, tri: Tensor, boost: float):
+    def forward(
+        ctx,
+        color: Tensor,
+        rast: Tensor,
+        pos: Tensor,
+        tri: Tensor,
+        boost: float,
+        neighbours: Tensor | None,
+    ):
         color = color.contiguous()
         rast = rast.detach().contiguous()
-        pos_c = pos.detach().contiguous()
+        pos_3d = pos.detach().contiguous()
+        if pos_3d.ndim == 2:
+            pos_3d = pos_3d[None]
         tri = tri.to(torch.int32).contiguous()
-        with torch.no_grad():
-            silhouette = _silhouette_edges(pos_c, tri.long()).to(torch.int8).contiguous()
-        px, py = pixel_centres(rast.shape[1], rast.shape[2], pos_c)
+        silhouette = _silhouette_edges(pos_3d, tri.long(), neighbours).to(torch.int8).contiguous()
+        px, py = pixel_centres(rast.shape[1], rast.shape[2], pos_3d)
         out = color.clone()
-        args = _launch_args(rast, pos_c, tri, color)
+        args = _launch_args(rast, pos_3d, tri, color)
         with torch.cuda.device(color.device):
             _forward_kernel[args["grid"]](
-                color, rast, pos_c, tri, silhouette, px, py, out, *args["sizes"],
-                BLOCK_P=BLOCK_PIXELS, BLOCK_C=BLOCK_CHANNELS,
+                color, rast, pos_3d, tri, silhouette, px, py, out, *args["sizes"],
+                BLOCK_P=BLOCK_PIXELS, BLOCK_C=BLOCK_CHANNELS, **_ties(pos_3d),
+                enable_fp_fusion=False,
             )  # fmt: skip
-        ctx.save_for_backward(color, rast, pos_c, tri, silhouette, px, py)
+        saved = (color, rast, pos_3d, tri, silhouette, px, py)
+        # A tensor made in inference mode cannot be saved for backward, but a copy of it can.
+        ctx.save_for_backward(*(t.clone() if t.is_inference() else t for t in saved))
         ctx.boost = boost
+        ctx.pos_shape = pos.shape
         return out
 
     @staticmethod
+    @first_order("antialias")
     def backward(ctx, grad_out: Tensor):
         color, rast, pos, tri, silhouette, px, py = ctx.saved_tensors
         grad_out = grad_out.contiguous()
@@ -263,21 +313,33 @@ class Antialias(torch.autograd.Function):
         with torch.cuda.device(color.device):
             _backward_kernel[args["grid"]](
                 color, rast, pos, tri, silhouette, px, py, grad_out, grad_color, grad_pos,
-                ctx.boost, *args["sizes"], BLOCK_P=BLOCK_PIXELS, BLOCK_C=BLOCK_CHANNELS,
+                ctx.boost, *args["sizes"],
+                BLOCK_P=BLOCK_PIXELS, BLOCK_C=BLOCK_CHANNELS, **_ties(pos),
+                enable_fp_fusion=False,
             )  # fmt: skip
-        return grad_color, None, grad_pos, None, None
+        return grad_color, None, grad_pos.view(ctx.pos_shape), None, None, None
 
 
-def antialias(color: Tensor, rast: Tensor, pos: Tensor, tri: Tensor, boost: float) -> Tensor:
+def antialias(
+    color: Tensor,
+    rast: Tensor,
+    pos: Tensor,
+    tri: Tensor,
+    boost: float,
+    neighbours: Tensor | None = None,
+) -> Tensor:
     if tri.shape[0] == 0:
-        return color
-    return Antialias.apply(color, rast, pos, tri, boost)
+        return color.clone()
+    return Antialias.apply(color, rast, pos, tri, boost, neighbours)
+
+
+def _ties(pos: Tensor) -> dict:
+    """The reference backend's tie margins, as constants of the kernels."""
+    return {"AXIS": AXIS_TIE, "EDGE": EDGE_TIE * torch.finfo(pos.dtype).eps}
 
 
 def _launch_args(rast: Tensor, pos: Tensor, tri: Tensor, color: Tensor) -> dict:
     batch, height, width, _ = rast.shape
     num_pixels = batch * height * width
-    return {
-        "grid": (triton.cdiv(num_pixels, BLOCK_PIXELS),),
-        "sizes": (num_pixels, height, width, pos.shape[1], tri.shape[0], color.shape[-1]),
-    }
+    sizes = (num_pixels, height, width, *pos.shape[:2], tri.shape[0], color.shape[-1])
+    return {"grid": (triton.cdiv(num_pixels, BLOCK_PIXELS),), "sizes": sizes}

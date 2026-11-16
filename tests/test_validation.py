@@ -23,10 +23,11 @@ def test_rasterize_rejects_bad_resolution(ctx, triangle, resolution):
         dr.rasterize(ctx, pos, tri, resolution)
 
 
-def test_rasterize_rejects_range_mode(ctx, triangle):
+def test_rasterize_ignores_ranges_in_instanced_mode(ctx, triangle):
     pos, tri = triangle
-    with pytest.raises(NotImplementedError, match="Range mode"):
-        dr.rasterize(ctx, pos, tri, (8, 8), ranges=torch.zeros(1, 2, dtype=torch.int32))
+    expected = dr.rasterize(ctx, pos, tri, (8, 8))
+    rast = dr.rasterize(ctx, pos, tri, (8, 8), ranges=torch.zeros(1, 2, dtype=torch.int32))
+    assert torch.equal(rast[0], expected[0])
 
 
 def test_interpolate_requires_rast_db_for_derivatives(triangle):
@@ -69,11 +70,11 @@ def test_texture_rejects_unknown_modes():
         dr.texture(tex, uv, boundary_mode="mirror")
 
 
-def test_texture_rejects_precomputed_mips():
+def test_texture_rejects_mip_that_is_not_a_list():
     tex = torch.zeros(1, 16, 16, 3)
     uv = torch.zeros(1, 8, 8, 2)
-    with pytest.raises(NotImplementedError, match="mip="):
-        dr.texture(tex, uv, mip=[tex])
+    with pytest.raises(TypeError, match="mip must be a list"):
+        dr.texture(tex, uv, mip=torch.zeros(1, 8, 8, 3))
 
 
 def test_texture_checks_mip_level_bias_shape():
