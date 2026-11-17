@@ -50,6 +50,7 @@ path = "src/diffrast/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "tests", "docs", "examples", "benchmarks", "CHANGELOG.md"]
+exclude = ["docs/images"]
 
 [tool.ruff]
 line-length = 100

@@ -11,7 +11,10 @@ single atomic min keeps the nearest triangle and resolves equal depths to the lo
 3. ``_tile_kernel`` runs one program per chunk, keeps the nearest hit per pixel in registers, and
    merges it into the buffer with one atomic per pixel.
 
-Coverage and depth use the same homogeneous formulation as the reference backend.
+Coverage and depth use the same homogeneous formulation as the reference backend, operation for
+operation. Both kernels are compiled without floating-point fusion: a fused multiply-add would
+break the exact antisymmetry of the edge functions of two triangles sharing an edge, and with it
+the guarantee that every pixel on that edge goes to exactly one of them.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from diffrast.backends.reference import pixel_centres
+from diffrast.backends.reference import AREA_TOLERANCE, pixel_centres
 
 TILE = 16
 # Triangles per tile program. Tiles with more triangles are split across programs.
@@ -34,6 +37,9 @@ SMALL = 4
 SETUP_BLOCK = 128
 
 EMPTY = torch.iinfo(torch.int64).max
+# Area below which a triangle is not drawn, relative to the magnitude of the terms it is computed
+# from; see the reference backend.
+TOLERANCE = tl.constexpr(AREA_TOLERANCE * torch.finfo(torch.float32).eps)
 
 
 @triton.jit
@@ -48,6 +54,25 @@ def _load_vertex(pos_ptr, tri_ptr, b, t, k, num_vert, mask):
 
 
 @triton.jit
+def _finite(x, y, z, w):
+    return tl.abs(x) + tl.abs(y) + tl.abs(z) + tl.abs(w) < float("inf")
+
+
+@triton.jit
+def _inside_edge(e, ai, ci, wi, aj, cj, wj, positive):
+    """Whether a pixel is on the inner side of the edge from vertex i to vertex j.
+
+    ``e = a_i * c_j - a_j * c_i`` is the edge function at the pixel and ``positive`` the sign of
+    the triangle's area. A pixel exactly on the edge is inside when the interior lies in the +x
+    direction, or in the +y direction for a horizontal edge; see the reference backend.
+    """
+    gx = ci * wj - cj * wi
+    gy = aj * wi - ai * wj
+    q = tl.where(e == 0, tl.where(gx == 0, gy, gx), e)
+    return (positive & (q > 0)) | (~positive & (q < 0))
+
+
+@triton.jit
 def _depth_key(x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2, px, py, t):
     """Packed ``(depth, t)`` key where the pixel ``(px, py)`` is covered, else the empty key."""
     a0, a1, a2 = x0 - px * w0, x1 - px * w1, x2 - px * w2
@@ -58,8 +83,24 @@ def _depth_key(x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2, px, py, t):
     s = e0 + e1 + e2
     ew = e0 * w0 + e1 * w1 + e2 * w2
     depth = (e0 * z0 + e1 * z1 + e2 * z2) / ew
-    inside = (s != 0) & (e0 * s >= 0) & (e1 * s >= 0) & (e2 * s >= 0) & (ew * s > 0)
-    inside = inside & (depth >= -1.0) & (depth <= 1.0)
+
+    positive = s > 0
+    inside = _inside_edge(e0, a1, c1, w1, a2, c2, w2, positive)
+    inside &= _inside_edge(e1, a2, c2, w2, a0, c0, w0, positive)
+    inside &= _inside_edge(e2, a0, c0, w0, a1, c1, w1, positive)
+
+    # Rounding of the vertex coordinates and of a and c can change s by about this much, so a
+    # smaller area is indistinguishable from zero.
+    reach_x = tl.maximum(tl.maximum(tl.abs(x0) + tl.abs(w0), tl.abs(x1) + tl.abs(w1)),
+                         tl.abs(x2) + tl.abs(w2))  # fmt: skip
+    reach_y = tl.maximum(tl.maximum(tl.abs(y0) + tl.abs(w0), tl.abs(y1) + tl.abs(w1)),
+                         tl.abs(y2) + tl.abs(w2))  # fmt: skip
+    span_x = tl.abs(a0) + tl.abs(a1) + tl.abs(a2)
+    span_y = tl.abs(c0) + tl.abs(c1) + tl.abs(c2)
+    inside &= tl.abs(s) > (reach_x * span_y + span_x * (reach_y + span_y)) * TOLERANCE
+
+    inside &= (positive & (ew > 0)) | (~positive & (ew < 0))
+    inside &= (depth >= -1.0) & (depth <= 1.0)
 
     # Map the float's bits to an integer with the same ordering.
     bits = depth.to(tl.int32, bitcast=True)
@@ -72,9 +113,11 @@ def _depth_key(x0, y0, z0, w0, x1, y1, z1, w1, x2, y2, z2, w2, px, py, t):
 @triton.jit
 def _pixel_range(lo, hi, size):
     """Indices of the pixel centres within ``[lo, hi]`` in NDC, as an inclusive range."""
-    # The margin keeps centres on the boundary despite rounding; extra pixels are tested exactly.
-    first = tl.math.ceil(((lo + 1.0) * size - 1.0) * 0.5 - 1e-3)
-    last = tl.math.floor(((hi + 1.0) * size - 1.0) * 0.5 + 1e-3)
+    # The margin keeps centres on the boundary despite rounding, which grows with the image size;
+    # extra pixels are tested exactly.
+    margin = 1e-3 + size * 1e-6
+    first = tl.math.ceil(((lo + 1.0) * size - 1.0) * 0.5 - margin)
+    last = tl.math.floor(((hi + 1.0) * size - 1.0) * 0.5 + margin)
     first = tl.minimum(tl.maximum(first, 0.0), size * 1.0)
     last = tl.minimum(tl.maximum(last, -1.0), size - 1.0)
     return first.to(tl.int32), last.to(tl.int32)
@@ -114,8 +157,10 @@ def _setup_kernel(
     x2, y2, z2, w2 = _load_vertex(pos_ptr, tri_ptr, b, t, 2, num_vert, valid)
 
     # Every point on a triangle is a non-negative combination of its vertices, so it is invisible
-    # when all vertices are behind the camera or outside the same clip plane.
-    culled = (w0 <= 0) & (w1 <= 0) & (w2 <= 0)
+    # when all vertices are behind the camera or outside the same clip plane. A triangle with a
+    # NaN or infinite coordinate fails every comparison below and would be binned into all tiles.
+    culled = ~(_finite(x0, y0, z0, w0) & _finite(x1, y1, z1, w1) & _finite(x2, y2, z2, w2))
+    culled |= (w0 <= 0) & (w1 <= 0) & (w2 <= 0)
     culled |= (x0 > w0) & (x1 > w1) & (x2 > w2)
     culled |= (x0 < -w0) & (x1 < -w1) & (x2 < -w2)
     culled |= (y0 > w0) & (y1 > w1) & (y2 > w2)
@@ -192,7 +237,8 @@ def _tile_kernel(
     HAS_PREV: tl.constexpr,
 ):
     item = tl.program_id(0)
-    tile = tl.load(item_tile_ptr + item)
+    # 64 bits, since pixel offsets pass 2**31 for large batches of large images.
+    tile = tl.load(item_tile_ptr + item).to(tl.int64)
     start = tl.load(item_start_ptr + item)
     end = tl.load(item_end_ptr + item)
 
@@ -200,14 +246,16 @@ def _tile_kernel(
     tile_in_image = tile % tiles_per_image
     row = (tile_in_image // tiles_x) * TILE + tl.arange(0, TILE)[:, None]
     col = (tile_in_image % tiles_x) * TILE + tl.arange(0, TILE)[None, :]
-    px = tl.load(px_ptr + col, mask=col < width, other=0.0)
-    py = tl.load(py_ptr + row, mask=row < height, other=0.0)
+    # Broadcast here, once: every triangle combines the row and column terms in several places,
+    # and expanding them inside the loop each time is slower.
+    px = tl.broadcast_to(tl.load(px_ptr + col, mask=col < width, other=0.0), (TILE, TILE))
+    py = tl.broadcast_to(tl.load(py_ptr + row, mask=row < height, other=0.0), (TILE, TILE))
 
     offs = (image * height + row) * width + col
     inside = (row < height) & (col < width)
     best = tl.full((TILE, TILE), 0x7FFFFFFFFFFFFFFF, tl.int64)
     for i in range(start, end):
-        g = tl.load(tri_list_ptr + i).to(tl.int64)
+        g = tl.load(tri_list_ptr + i)
         b, t = g // num_tri, g % num_tri
         x0, y0, z0, w0 = _load_vertex(pos_ptr, tri_ptr, b, t, 0, num_vert, True)
         x1, y1, z1, w1 = _load_vertex(pos_ptr, tri_ptr, b, t, 1, num_vert, True)
@@ -293,6 +341,7 @@ def setup_stage(state: Pass) -> None:
             state.pos, state.tri, state.px, state.py, state.keys, _previous(state),
             state.tile_box, total, state.num_tri, state.pos.shape[1], state.height, state.width,
             TILE=TILE, SMALL=SMALL, BLOCK=SETUP_BLOCK, HAS_PREV=state.previous is not None,
+            enable_fp_fusion=False,
         )  # fmt: skip
 
 
@@ -315,6 +364,7 @@ def tile_stage(state: Pass, lists) -> None:
             state.pos, state.tri, tri_list, item_tile, item_start, item_end, state.px, state.py,
             state.keys, _previous(state), state.num_tri, state.pos.shape[1], state.height,
             state.width, tiles_x, tiles_per_image, TILE=TILE, HAS_PREV=state.previous is not None,
+            enable_fp_fusion=False,
         )  # fmt: skip
 
 
@@ -324,8 +374,9 @@ def _bin_triangles(tile_box: Tensor, batch: int, height: int, width: int):
     ``tile_box`` holds ``(first, last)`` tile columns and rows per triangle, with ``first`` column
     -1 for triangles that need no tiling. Returns ``(tri_list, item_tile, item_start, item_end,
     tiles_x, tiles_per_image)``, where ``tri_list`` holds flat ``batch * num_tri + tri`` indices
-    grouped by tile, and each work item covers ``tri_list[item_start:item_end]`` of tile
-    ``item_tile``. Returns ``None`` when there is nothing to tile.
+    (64-bit, as a large batch of large meshes passes ``2**31``) grouped by tile, and each work
+    item covers ``tri_list[item_start:item_end]`` of tile ``item_tile``. Returns ``None`` when
+    there is nothing to tile.
     """
     device = tile_box.device
     num_tri = tile_box.shape[0] // batch
@@ -347,7 +398,7 @@ def _bin_triangles(tile_box: Tensor, batch: int, height: int, width: int):
     tile = (g[owner] // num_tri * tiles_y + tile_y) * tiles_x + tile_x
 
     sorted_tile, order = torch.sort(tile, stable=True)
-    tri_list = g[owner][order].to(torch.int32)
+    tri_list = g[owner][order]
 
     # Binary search on the sorted list instead of bincount, whose atomics contend heavily when
     # many triangles share few tiles.

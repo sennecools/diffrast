@@ -186,10 +186,8 @@ class TestInterpolate:
             ref = reference.interpolate(attr, rast, tri, rast_db, diff)
             out = triton_backend.interpolate(attr, rast, tri, rast_db, diff)
             torch.testing.assert_close(out[0], ref[0])
-            if diff:
-                torch.testing.assert_close(out[1], ref[1])
-            else:
-                assert out[1] is None
+            assert out[1].shape == (*rast.shape[:3], 2 * len(diff))
+            torch.testing.assert_close(out[1], ref[1])
 
     @pytest.mark.parametrize("attr_layout", ["shared", "per_view"])
     @pytest.mark.parametrize("diff", [[], [0, 2, 3]])
@@ -208,6 +206,20 @@ class TestInterpolate:
             grads.append([t.grad if t.grad is not None else torch.zeros_like(t) for t in inputs])
         for ours, ref in zip(grads[1], grads[0], strict=True):
             torch.testing.assert_close(ours, ref, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("diff", [[], [0, 2, 3]])
+    def test_constant_attributes_still_pass_gradients_to_rast(self, diff):
+        attr, rast, rast_db, tri = self.scene(5, "shared", seed=5)
+        grads = []
+        for backend in (reference, triton_backend):
+            r, d = (t.clone().requires_grad_(True) for t in (rast, rast_db))
+            out, out_da = backend.interpolate(attr, r, tri, d, diff)
+            (out.sum() + out_da.square().sum()).backward()
+            grads.append((r.grad, d.grad if diff else None))
+        torch.testing.assert_close(grads[1][0], grads[0][0], atol=1e-4, rtol=1e-4)
+        if diff:
+            torch.testing.assert_close(grads[1][1], grads[0][1], atol=1e-4, rtol=1e-4)
+        assert attr.grad is None
 
     def test_gradient_through_derivatives_only(self):
         attr, rast, rast_db, tri = self.scene(4, "shared", seed=3)
@@ -330,6 +342,7 @@ class TestTexture:
     @pytest.mark.parametrize("filter_mode", ["nearest", "linear", "linear-mipmap-nearest"])
     def test_unused_uv_da_gets_no_gradient(self, filter_mode):
         tex, uv, uv_da = self.scene()
+        tex.requires_grad_(True)
         uv_da.requires_grad_(True)
         triton_backend.texture(tex, uv, uv_da, filter_mode, "wrap", None).sum().backward()
         assert uv_da.grad is None or (uv_da.grad == 0).all()

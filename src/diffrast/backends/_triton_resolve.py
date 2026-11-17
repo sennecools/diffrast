@@ -3,7 +3,9 @@
 Per pixel, the visible triangle's homogeneous edge functions ``e = a x c`` (with ``a = x - px w``
 and ``c = y - py w`` per vertex) give the perspective-correct barycentrics ``b = e / S``,
 ``S = sum(e)``, and ``z / w = (e . z) / (e . w)``. Their screen-space derivatives follow from
-``de/dpx = c x w`` and ``de/dpy = w x a``. These are the reference backend's formulas.
+``de/dpx = c x w`` and ``de/dpy = w x a``. These are the reference backend's formulas. Unlike the
+visibility kernels, these are compiled with floating-point fusion, which makes the barycentrics
+of small triangles more accurate; which triangle a pixel shows is already decided.
 
 The backward kernel runs the same steps in reverse. For a cross product ``f = u x v`` with
 upstream gradient ``G``, the gradients are ``v x G`` for ``u`` and ``G x u`` for ``v``. Vertex
@@ -18,6 +20,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from diffrast.backends._autograd import first_order
 from diffrast.backends.reference import pixel_centres
 
 # Each program handles one tile of pixels, so that its pixels mostly share a few triangles.
@@ -31,6 +34,12 @@ MIN_GROUP = 4
 @triton.jit
 def _cross(u0, u1, u2, v0, v1, v2):
     return u1 * v2 - u2 * v1, u2 * v0 - u0 * v2, u0 * v1 - u1 * v0
+
+
+@triton.jit
+def _pixel_size(size, dtype):
+    """Size of one pixel in NDC, in the precision the kernel works in."""
+    return 2.0 / size.to(dtype)
 
 
 @triton.jit
@@ -92,7 +101,7 @@ def _forward_kernel(keys_ptr, tri_ptr, pos_ptr, px_ptr, py_ptr, rast_ptr, db_ptr
     dx0, dx1, dx2 = _cross(c0, c1, c2, w0, w1, w2)
     dy0, dy1, dy2 = _cross(w0, w1, w2, a0, a1, a2)
     sx, sy = dx0 + dx1 + dx2, dy0 + dy1 + dy2
-    scale_x, scale_y = 2.0 / width, 2.0 / height
+    scale_x, scale_y = _pixel_size(width, b0.dtype), _pixel_size(height, b0.dtype)
 
     zero = tl.zeros_like(b0)
     out = rast_ptr + p * 4
@@ -180,10 +189,11 @@ def _backward_kernel(keys_ptr, tri_ptr, pos_ptr, px_ptr, py_ptr, grad_rast_ptr, 
         dy0, dy1, dy2 = _cross(w0, w1, w2, a0, a1, a2)
         sx, sy = dx0 + dx1 + dx2, dy0 + dy1 + dy2
         g = grad_db_ptr + p * 4
-        gbx0 = tl.load(g, mask=covered, other=0.0) * (2.0 / width)
-        gby0 = tl.load(g + 1, mask=covered, other=0.0) * (2.0 / height)
-        gbx1 = tl.load(g + 2, mask=covered, other=0.0) * (2.0 / width)
-        gby1 = tl.load(g + 3, mask=covered, other=0.0) * (2.0 / height)
+        scale_x, scale_y = _pixel_size(width, b0.dtype), _pixel_size(height, b0.dtype)
+        gbx0 = tl.load(g, mask=covered, other=0.0) * scale_x
+        gby0 = tl.load(g + 1, mask=covered, other=0.0) * scale_y
+        gbx1 = tl.load(g + 2, mask=covered, other=0.0) * scale_x
+        gby1 = tl.load(g + 3, mask=covered, other=0.0) * scale_y
         # db_dx_k = (de_dx_k - b_k * sum(de_dx)) / s, and the same along y.
         dbx0, dbx1 = (dx0 - b0 * sx) / s, (dx1 - b1 * sx) / s
         dby0, dby1 = (dy0 - b0 * sy) / s, (dy1 - b1 * sy) / s
@@ -246,7 +256,7 @@ class Resolve(torch.autograd.Function):
         with torch.cuda.device(pos.device):
             _forward_kernel[_grid(batch, height, width)](
                 keys, tri, pos_c, px, py, rast, rast_db, height, width, pos.shape[1],
-                TILE_H=TILE_H, TILE_W=TILE_W,
+                TILE_H=TILE_H, TILE_W=TILE_W, enable_fp_fusion=True,
             )  # fmt: skip
         ctx.save_for_backward(pos_c, tri, keys, px, py)
         ctx.grad_db = grad_db
@@ -255,6 +265,7 @@ class Resolve(torch.autograd.Function):
         return rast, rast_db
 
     @staticmethod
+    @first_order("rasterize")
     def backward(ctx, grad_rast: Tensor | None, grad_rast_db: Tensor | None):
         pos, tri, keys, px, py = ctx.saved_tensors
         batch, height, width = keys.shape
@@ -268,7 +279,7 @@ class Resolve(torch.autograd.Function):
             _backward_kernel[_grid(batch, height, width)](
                 keys, tri, pos, px, py, grad_rast, grad_rast_db, grad_pos,
                 height, width, pos.shape[1], TILE_H=TILE_H, TILE_W=TILE_W, GRAD_DB=use_db,
-                MAX_ROUNDS=MAX_ROUNDS, MIN_GROUP=MIN_GROUP,
+                MAX_ROUNDS=MAX_ROUNDS, MIN_GROUP=MIN_GROUP, enable_fp_fusion=True,
             )  # fmt: skip
         return grad_pos, None, None, None
 

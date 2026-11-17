@@ -24,12 +24,14 @@ python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 python -m pip install --upgrade pip  # --group needs pip 25.1+
 pip install torch                    # or the CUDA / ROCm build for your GPU
-pip install -e . --group dev
+pip install -e . --group dev --group examples
 pre-commit install
 ```
 
 For a GPU setup on Windows, including AMD, see the installation notes in the
-[README](README.md#installation).
+[README](README.md#installation). Do not run Python from inside `src/diffrast` or put that
+directory on `sys.path`: `diffrast/torch.py` would shadow PyTorch there (it raises an `ImportError`
+that says so).
 
 ## Tests
 
@@ -41,7 +43,8 @@ Tests marked `gpu` are skipped when no CUDA or ROCm device is available. If you 
 please run the suite on a GPU and mention the device in your pull request.
 
 New ops and backends should be tested against the reference backend, and gradients checked with
-`torch.autograd.gradcheck` in float64 on small scenes.
+`torch.autograd.gradcheck` in float64 on small scenes. `tests/test_examples.py` runs every example
+with small sizes on the CPU; a new example needs an entry there.
 
 ## Style
 

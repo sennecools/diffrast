@@ -3,6 +3,9 @@
 Each program handles a block of pixels and loops over the attribute channels in chunks. The
 backward pass accumulates the gradients of ``rast`` and ``rast_db`` per pixel in registers and
 scatters the gradients of ``attr`` to the vertices with atomic adds.
+
+The kernels are compiled without floating-point fusion, so the weighted sums round as in the
+reference backend whatever the default of the installed Triton is.
 """
 
 from __future__ import annotations
@@ -12,15 +15,18 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from diffrast.backends._autograd import first_order
+
 BLOCK_PIXELS = 64
 
 
 @triton.jit
-def _load_pixel(rast_ptr, tri_ptr, p, valid, pixels_per_image, attr_batch_stride):
+def _load_pixel(rast_ptr, tri_ptr, p, valid, pixels_per_image, attr_batch_stride, num_tri):
     u = tl.load(rast_ptr + p * 4, mask=valid, other=0.0)
     v = tl.load(rast_ptr + p * 4 + 1, mask=valid, other=0.0)
     tri_id = (tl.load(rast_ptr + p * 4 + 3, mask=valid, other=0.0) + 0.5).to(tl.int64) - 1
-    covered = valid & (tri_id >= 0)
+    # Ids past the end of tri are drawn as background rather than read out of range.
+    covered = valid & (tri_id >= 0) & (tri_id < num_tri)
     i0 = tl.load(tri_ptr + tri_id * 3, mask=covered, other=0).to(tl.int64)
     i1 = tl.load(tri_ptr + tri_id * 3 + 1, mask=covered, other=0).to(tl.int64)
     i2 = tl.load(tri_ptr + tri_id * 3 + 2, mask=covered, other=0).to(tl.int64)
@@ -40,6 +46,7 @@ def _forward_kernel(
     num_pixels,
     pixels_per_image,
     attr_batch_stride,
+    num_tri,
     channels,
     num_diff,
     HAS_DA: tl.constexpr,
@@ -49,7 +56,7 @@ def _forward_kernel(
     p = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
     valid = p < num_pixels
     u, v, covered, base, i0, i1, i2 = _load_pixel(
-        rast_ptr, tri_ptr, p, valid, pixels_per_image, attr_batch_stride
+        rast_ptr, tri_ptr, p, valid, pixels_per_image, attr_batch_stride, num_tri
     )
     u, v = u[:, None], v[:, None]
     row0 = (base + i0 * channels)[:, None]
@@ -99,16 +106,18 @@ def _backward_kernel(
     num_pixels,
     pixels_per_image,
     attr_batch_stride,
+    num_tri,
     channels,
     num_diff,
     HAS_DA: tl.constexpr,
+    ATTR_GRAD: tl.constexpr,
     BLOCK_P: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
     p = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
     valid = p < num_pixels
     u, v, covered, base, i0, i1, i2 = _load_pixel(
-        rast_ptr, tri_ptr, p, valid, pixels_per_image, attr_batch_stride
+        rast_ptr, tri_ptr, p, valid, pixels_per_image, attr_batch_stride, num_tri
     )
     row0 = (base + i0 * channels)[:, None]
     row1 = (base + i1 * channels)[:, None]
@@ -125,9 +134,11 @@ def _backward_kernel(
         a2 = tl.load(attr_ptr + row2 + c, mask=mask, other=0.0)
         grad_u += tl.sum(g * (a0 - a2), axis=1)
         grad_v += tl.sum(g * (a1 - a2), axis=1)
-        tl.atomic_add(grad_attr_ptr + row0 + c, g * u[:, None], mask=mask)
-        tl.atomic_add(grad_attr_ptr + row1 + c, g * v[:, None], mask=mask)
-        tl.atomic_add(grad_attr_ptr + row2 + c, g * (1 - u - v)[:, None], mask=mask)
+        # Many pixels share a vertex, so these atomics contend; skip them when unused.
+        if ATTR_GRAD:
+            tl.atomic_add(grad_attr_ptr + row0 + c, g * u[:, None], mask=mask)
+            tl.atomic_add(grad_attr_ptr + row1 + c, g * v[:, None], mask=mask)
+            tl.atomic_add(grad_attr_ptr + row2 + c, g * (1 - u - v)[:, None], mask=mask)
 
     tl.store(grad_rast_ptr + p * 4, grad_u, mask=valid)
     tl.store(grad_rast_ptr + p * 4 + 1, grad_v, mask=valid)
@@ -158,11 +169,12 @@ def _backward_kernel(
             grad_du_dy += tl.sum(gy * da_du, axis=1)
             grad_dv_dx += tl.sum(gx * da_dv, axis=1)
             grad_dv_dy += tl.sum(gy * da_dv, axis=1)
-            g_a0 = gx * du_dx + gy * du_dy
-            g_a1 = gx * dv_dx + gy * dv_dy
-            tl.atomic_add(grad_attr_ptr + row0 + c, g_a0, mask=mask)
-            tl.atomic_add(grad_attr_ptr + row1 + c, g_a1, mask=mask)
-            tl.atomic_add(grad_attr_ptr + row2 + c, -(g_a0 + g_a1), mask=mask)
+            if ATTR_GRAD:
+                g_a0 = gx * du_dx + gy * du_dy
+                g_a1 = gx * dv_dx + gy * dv_dy
+                tl.atomic_add(grad_attr_ptr + row0 + c, g_a0, mask=mask)
+                tl.atomic_add(grad_attr_ptr + row1 + c, g_a1, mask=mask)
+                tl.atomic_add(grad_attr_ptr + row2 + c, -(g_a0 + g_a1), mask=mask)
 
         tl.store(grad_db_ptr + p * 4, grad_du_dx, mask=valid)
         tl.store(grad_db_ptr + p * 4 + 1, grad_du_dy, mask=valid)
@@ -194,16 +206,22 @@ class Interpolate(torch.autograd.Function):
             _forward_kernel[args["grid"]](
                 attr_3d, rast, db, tri, diff, out, out_da,
                 args["num_pixels"], args["pixels_per_image"], args["batch_stride"],
-                channels, num_diff,
+                tri.shape[0], channels, num_diff,
                 HAS_DA=has_da, BLOCK_P=BLOCK_PIXELS, BLOCK_C=args["block_c"],
+                enable_fp_fusion=False,
             )  # fmt: skip
-        ctx.save_for_backward(attr_3d, rast, db, tri, diff)
+        saved = (attr_3d, rast, db, tri, diff)
+        # A tensor made in inference mode cannot be saved for backward, but a copy of it can.
+        ctx.save_for_backward(*(t.clone() if t.is_inference() else t for t in saved))
         ctx.attr_shape = attr.shape
         ctx.has_da = has_da
         ctx.rast_db_given = rast_db is not None
+        if not has_da:
+            ctx.mark_non_differentiable(out_da)
         return out, out_da
 
     @staticmethod
+    @first_order("interpolate")
     def backward(ctx, grad_out: Tensor | None, grad_out_da: Tensor | None):
         attr_3d, rast, db, tri, diff = ctx.saved_tensors
         channels = attr_3d.shape[2]
@@ -214,7 +232,8 @@ class Interpolate(torch.autograd.Function):
         grad_out = grad_out.contiguous()
         grad_out_da = grad_out_da.contiguous() if has_da else grad_out
 
-        grad_attr = torch.zeros_like(attr_3d)
+        attr_grad = ctx.needs_input_grad[0]
+        grad_attr = torch.zeros_like(attr_3d) if attr_grad else attr_3d
         grad_rast = torch.empty_like(rast)
         grad_db = torch.zeros_like(rast) if has_da else grad_rast
         args = _launch_args(rast, attr_3d, channels, num_diff)
@@ -223,14 +242,16 @@ class Interpolate(torch.autograd.Function):
                 attr_3d, rast, db, tri, diff, grad_out, grad_out_da,
                 grad_attr, grad_rast, grad_db,
                 args["num_pixels"], args["pixels_per_image"], args["batch_stride"],
-                channels, num_diff,
-                HAS_DA=has_da, BLOCK_P=BLOCK_PIXELS, BLOCK_C=args["block_c"],
+                tri.shape[0], channels, num_diff,
+                HAS_DA=has_da, ATTR_GRAD=attr_grad, BLOCK_P=BLOCK_PIXELS,
+                BLOCK_C=args["block_c"], enable_fp_fusion=False,
             )  # fmt: skip
 
         grad_db_out = None
         if ctx.rast_db_given:
             grad_db_out = grad_db if has_da else torch.zeros_like(rast)
-        return grad_attr.view(ctx.attr_shape), grad_rast, grad_db_out, None, None
+        grad_attr = grad_attr.view(ctx.attr_shape) if attr_grad else None
+        return grad_attr, grad_rast, grad_db_out, None, None
 
 
 def _launch_args(rast: Tensor, attr_3d: Tensor, channels: int, num_diff: int) -> dict:

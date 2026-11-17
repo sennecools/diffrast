@@ -80,5 +80,5 @@ def test_peeler_validates_inputs(ctx, triangle):
     pos, tri = triangle
     with pytest.raises(ValueError, match="pos must have shape"):
         dr.DepthPeeler(ctx, pos[..., :3], tri, (8, 8))
-    with pytest.raises(NotImplementedError, match="Range mode"):
-        dr.DepthPeeler(ctx, pos, tri, (8, 8), ranges=torch.zeros(1, 2, dtype=torch.int32))
+    with pytest.raises(ValueError, match="ranges is required"):
+        dr.DepthPeeler(ctx, pos[0], tri, (8, 8))
